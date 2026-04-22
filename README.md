@@ -4,7 +4,7 @@ Video Presentation - [Click Here](https://www.youtube.com/watch?v=kiBZ86F8_SU)*
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.28+-red.svg)](https://streamlit.io)
-[![Claude](https://img.shields.io/badge/Anthropic-Claude-orange.svg)](https://anthropic.com)
+[![OpenAI](https://img.shields.io/badge/OpenAI-ChatGPT-10a37f.svg)](https://openai.com)
 
 ## 📋 Table of Contents
 
@@ -102,7 +102,7 @@ graph TD
 ```bash
 # Setup
 git clone <repository-url>
-cd bank_statement_analyzer
+cd personal-finance-advisor
 python -m venv venv
 source venv/bin/activate
 
@@ -110,7 +110,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Configure API key
-echo "ANTHROPIC_API_KEY=your_key_here" > .env
+echo "OPENAI_API_KEY=your_key_here" > .env
 
 # Launch web interface
 streamlit run streamlit_app.py

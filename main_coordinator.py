@@ -30,14 +30,14 @@ class BankStatementAnalyzer:
     Follows exact project requirements for hybrid multi-agent system
     """
     
-    def __init__(self, anthropic_api_key: str):
+    def __init__(self, openai_api_key: str):
         """Initialize the complete 3-agent system"""
         
         print("🏦 INITIALIZING BANK STATEMENT ANALYZER")
         print("=" * 50)
         
         # Initialize centralized LLM interface
-        self.llm = LLMInterface(anthropic_api_key)
+        self.llm = LLMInterface(openai_api_key)
         
         # Initialize all 3 agents (following project architecture)
         self.agent1 = DocumentProcessorAgent()              # 0 LLM calls
@@ -97,13 +97,22 @@ class BankStatementAnalyzer:
             
             # Deterministic routing based on Agent 1 results
             if not doc_result['success']:
-                return self._create_error_response(f"Document processing failed: {doc_result['error']}")
+                return self._create_error_response(
+                    f"Document processing failed: {doc_result['error']}",
+                    debug_info={'document_processing': doc_result}
+                )
             
             transactions = doc_result['transactions']
             
             # Route based on transaction count (deterministic logic)
             if len(transactions) == 0:
-                return self._create_error_response("No transactions found in document")
+                return self._create_error_response(
+                    "No transactions found in document. The statement format may need additional parsing rules.",
+                    debug_info={
+                        'parsing_stats': doc_result.get('parsing_stats', {}),
+                        'sample_transaction_lines': doc_result.get('raw_transaction_lines', [])[:10]
+                    }
+                )
             elif len(transactions) > 500:
                 return self._create_error_response("Too many transactions - please split file")
             
@@ -139,6 +148,10 @@ class BankStatementAnalyzer:
                 'success': True,
                 'analysis': final_analysis,
                 'transactions': categorized_transactions,
+                'document_debug': {
+                    'parsing_stats': doc_result.get('parsing_stats', {}),
+                    'sample_transaction_lines': doc_result.get('raw_transaction_lines', [])[:10]
+                },
                 'system_metrics': {
                     'total_llm_calls': total_llm_calls,
                     'estimated_cost': self.llm.total_cost,
@@ -183,9 +196,9 @@ class BankStatementAnalyzer:
         
         return {'valid': True}
     
-    def _create_error_response(self, error_message: str) -> Dict:
+    def _create_error_response(self, error_message: str, debug_info: Optional[Dict] = None) -> Dict:
         """Standardized error response"""
-        return {
+        response = {
             'success': False,
             'error': error_message,
             'system_metrics': {
@@ -198,6 +211,9 @@ class BankStatementAnalyzer:
                 }
             }
         }
+        if debug_info:
+            response['debug_info'] = debug_info
+        return response
     
     def _update_session_state(self, llm_calls_used: int):
         """Update session tracking"""
@@ -245,10 +261,10 @@ def main_cli():
     
     # Load API key
     load_dotenv()
-    api_key = os.getenv('ANTHROPIC_API_KEY')
+    api_key = os.getenv('OPENAI_API_KEY')
     
     if not api_key:
-        print("❌ Please set ANTHROPIC_API_KEY in .env file")
+        print("❌ Please set OPENAI_API_KEY in .env file")
         return
     
     # Initialize system

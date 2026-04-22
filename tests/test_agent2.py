@@ -14,7 +14,7 @@ def test_agent2():
     """Test Agent 2 with real data from Agent 1"""
     
     load_dotenv()
-    api_key = os.getenv('ANTHROPIC_API_KEY')
+    api_key = os.getenv('OPENAI_API_KEY')
     
     print("🧪 TESTING AGENT 2: Content Analyzer")
     print("=" * 50)

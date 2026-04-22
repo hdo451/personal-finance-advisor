@@ -15,7 +15,7 @@ def test_complete_pipeline():
     """Test all 3 agents working together"""
     
     load_dotenv()
-    api_key = os.getenv('ANTHROPIC_API_KEY')
+    api_key = os.getenv('OPENAI_API_KEY')
     
     print("🧪 TESTING COMPLETE 3-AGENT PIPELINE")
     print("=" * 60)

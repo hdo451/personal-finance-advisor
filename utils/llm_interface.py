@@ -1,48 +1,54 @@
-import anthropic
-import json
-from typing import List, Dict, Optional
+from openai import OpenAI
+from typing import Dict, Optional
 
 class LLMInterface:
     """
-    Centralized Anthropic Claude management
+    Centralized OpenAI ChatGPT management
     Tracks every call for cost analysis
     """
 
     def __init__(self, api_key: str):
-        self.client = anthropic.Anthropic(api_key=api_key)
+        self.client = OpenAI(api_key=api_key)
         self.call_count = 0    # Track total calls
         self.total_cost = 0.0  # Track estimated cost
 
-    def make_call(self, prompt: str, system_prompt: str = None) -> Optional[str]:
+    def make_call(self, prompt: str, system_prompt: str = None, expect_json: bool = False) -> Optional[str]:
         """
         Single point for ALL LLM calls in your system
         Every agent must use this method
         """
         self.call_count += 1
-        print(f"🤖 LLM Call #{self.call_count} - Claude API")
+        print(f"🤖 LLM Call #{self.call_count} - OpenAI API")
 
         try:
-            # Build message
+            # Build OpenAI-compatible messages
             messages = []
             if system_prompt:
-                messages.append({"role": "user", "content": f"System: {system_prompt}\n\nUser: {[prompt]}"})
-            else:
-                messages.append({"role": "user", "content": prompt})
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
 
-            # Make Claude API call
-            response = self.client.messages.create(
-                model="claude-3-haiku-20240307",
-                max_tokens=1000,
-                messages=messages
-            )
+            # Make ChatGPT API call
+            request_payload = {
+                "model": "gpt-4o-mini",
+                "max_tokens": 3000,
+                "messages": messages,
+                "temperature": 0,
+            }
+            if expect_json:
+                request_payload["response_format"] = {"type": "json_object"}
+
+            response = self.client.chat.completions.create(**request_payload)
 
             # Track cost (using project estimate)
             self.total_cost += 0.002
 
-            return response.content[0].text
+            content = response.choices[0].message.content
+            if not content:
+                return None
+            return content
         
         except Exception as e:
-            print(f"❌ Claude API call failed: {e}")
+            print(f"❌ OpenAI API call failed: {e}")
             return None
         
     def get_metrics(self) -> Dict:

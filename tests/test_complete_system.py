@@ -12,7 +12,7 @@ def test_complete_system():
     """Test the integrated 3-agent system"""
     
     load_dotenv()
-    api_key = os.getenv('ANTHROPIC_API_KEY')
+    api_key = os.getenv('OPENAI_API_KEY')
     
     print("🧪 TESTING COMPLETE INTEGRATED SYSTEM")
     print("=" * 60)

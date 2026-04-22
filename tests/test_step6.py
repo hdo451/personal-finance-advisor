@@ -242,7 +242,7 @@ def test_step6_and_7_completion():
         
         print(f"\n📈 Next Step Preview:")
         print(f"   Step 8: Build Agent 2 - Content Analyzer (1 LLM call)")
-        print(f"   Goal: Categorize unclear transactions using Claude API")
+        print(f"   Goal: Categorize unclear transactions using ChatGPT API")
         print(f"   Input: {total_transactions_parsed - total_categorized} uncategorized transactions")
         
     else:

@@ -11,16 +11,93 @@ import plotly.graph_objects as go
 import pandas as pd
 from datetime import datetime
 import os
+import copy
 from dotenv import load_dotenv
+
+try:
+    from streamlit_plotly_events import plotly_events
+    PLOTLY_EVENTS_AVAILABLE = True
+except ImportError:
+    PLOTLY_EVENTS_AVAILABLE = False
 
 # Import your system
 from main_coordinator import BankStatementAnalyzer
+
+CATEGORY_CODES = [
+    'food_dining',
+    'groceries',
+    'transportation',
+    'shopping',
+    'bills_utilities',
+    'entertainment',
+    'healthcare',
+    'income',
+    'fees',
+    'other',
+    'uncategorized',
+]
+
+def _category_code_to_label(code: str) -> str:
+    return code.replace('_', ' ').title()
+
+def _category_label_to_code(label: str) -> str:
+    normalized = str(label).strip().lower().replace(' ', '_')
+    if normalized in CATEGORY_CODES:
+        return normalized
+    return 'other'
+
+def _transactions_to_editor_df(transactions: list) -> pd.DataFrame:
+    """Create editable DataFrame for manual category review."""
+    rows = []
+    for idx, txn in enumerate(transactions):
+        rows.append({
+            '_txn_index': idx,
+            'Date': txn['date'],
+            'Description': txn['description'],
+            'Category': _category_code_to_label(txn['category']),
+            'Amount': txn['amount'],
+            'Type': 'OUT' if txn['is_debit'] else 'IN',
+            'Confidence': f"{txn['confidence']:.0%}",
+            'Source': txn['source'].title()
+        })
+    return pd.DataFrame(rows)
+
+def _get_category_items_for_modal(transactions: list, category_label: str) -> list:
+    """Return debit transactions for the selected category, preserving table order."""
+    category_code = _category_label_to_code(category_label)
+    category_items = []
+
+    for txn in transactions:
+        if txn['is_debit'] and txn['category'] == category_code:
+            category_items.append({
+                'Description': txn['description'],
+                'Amount': txn['amount']
+            })
+
+    return category_items
+
+if hasattr(st, 'dialog'):
+    @st.dialog("Category Items")
+    def _show_category_items_modal(category_label: str, transactions: list):
+        st.subheader(f"{category_label} - Items")
+        items = _get_category_items_for_modal(transactions, category_label)
+
+        if not items:
+            st.info("No spending items found for this category.")
+            return
+
+        for item in items:
+            amount_formatted = f"${item['Amount']:.2f}"
+            st.write(f"{item['Description']} | {amount_formatted}")
+else:
+    def _show_category_items_modal(category_label: str, transactions: list):
+        st.warning("Your Streamlit version does not support modal dialogs. Please upgrade Streamlit to use this feature.")
 
 def initialize_session_state():
     """Initialize Streamlit session state"""
     if 'analyzer' not in st.session_state:
         load_dotenv()
-        api_key = os.getenv('ANTHROPIC_API_KEY')
+        api_key = os.getenv('OPENAI_API_KEY')
         
         if api_key:
             with st.spinner("🏗️ Initializing 3-agent system..."):
@@ -28,7 +105,13 @@ def initialize_session_state():
             st.success("✅ System ready!")
         else:
             st.session_state.analyzer = None
-            st.error("❌ Please set ANTHROPIC_API_KEY in .env file")
+            st.error("❌ Please set OPENAI_API_KEY in .env file")
+
+    if 'analysis_result' not in st.session_state:
+        st.session_state.analysis_result = None
+
+    if 'generate_ai_insights' not in st.session_state:
+        st.session_state.generate_ai_insights = False
 
 def main():
     """Main Streamlit application"""
@@ -73,13 +156,15 @@ def main():
             
             # Project info
             st.subheader("Project Details")
-            st.write("**Course**: CSYE 7374")
+            st.write("**Course**: AIasesor, finantial AI advisor")
             st.write("**Type**: Hybrid Multi-Agent System")
+            st.caption("All responses must be validated by experts.")
+            st.caption("Artifitial intellillence may not be accurate.")
             st.write("**Efficiency**: ≤2 LLM calls per analysis")
             
         else:
             st.error("❌ System initialization failed")
-            st.write("Please check your .env file contains ANTHROPIC_API_KEY")
+            st.write("Please check your .env file contains OPENAI_API_KEY")
     
     # Main content area
     if not st.session_state.analyzer:
@@ -118,6 +203,10 @@ def main():
         # Analysis button
         if st.button("🚀 Analyze Statement", type="primary", use_container_width=True):
             process_uploaded_file(uploaded_file, generate_insights)
+
+        if st.session_state.analysis_result:
+            show_debug_diagnostics(st.session_state.analysis_result)
+            display_results(st.session_state.analysis_result)
     
     else:
         # Instructions when no file uploaded
@@ -206,10 +295,13 @@ def process_uploaded_file(uploaded_file, generate_insights: bool):
         
         # Display results
         if result['success']:
+            st.session_state.analysis_result = result
+            st.session_state.generate_ai_insights = generate_insights
             st.success("🎉 Analysis completed successfully!")
-            display_results(result)
         else:
             st.error(f"❌ Analysis failed: {result['error']}")
+            st.info("Tip: If this is a local bank statement/cartola, try a cleaner PDF export (text-based, not scanned image).")
+            show_debug_diagnostics(result)
     
     except Exception as e:
         st.error(f"❌ Error processing file: {str(e)}")
@@ -270,17 +362,65 @@ def display_results(result: dict):
         with chart_col1:
             st.subheader("🏷️ Spending by Category")
             
-            # Create pie chart data
-            category_names = [cat['category'].replace('_', ' ').title() for cat in categories]
-            category_amounts = [cat['total'] for cat in categories]
-            
-            fig_pie = px.pie(
-                values=category_amounts,
-                names=category_names,
-                title="Spending Distribution"
+            # Build the pie from raw debit transactions so each slice reflects total spend.
+            spending_totals = {}
+            for txn in result['transactions']:
+                if txn['is_debit']:
+                    category_label = txn['category'].replace('_', ' ').title()
+                    spending_totals[category_label] = spending_totals.get(category_label, 0.0) + float(txn['amount'])
+
+            spending_rows = (
+                pd.DataFrame(
+                    [{
+                        'Category': category,
+                        'Amount': float(amount)
+                    } for category, amount in spending_totals.items()]
+                )
+                .sort_values('Amount', ascending=False)
+                .reset_index(drop=True)
             )
-            fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig_pie, use_container_width=True)
+
+            category_names = spending_rows['Category'].tolist()
+            category_amounts = spending_rows['Amount'].tolist()
+            pie_colors = px.colors.qualitative.Set3 + px.colors.qualitative.Pastel + px.colors.qualitative.Bold
+            
+            fig_pie = go.Figure(
+                data=[
+                    go.Pie(
+                        labels=category_names,
+                        values=category_amounts,
+                        sort=False,
+                        direction='clockwise',
+                        textposition='inside',
+                        textinfo='percent+label',
+                        marker=dict(
+                            colors=pie_colors[:len(category_names)],
+                            line=dict(color='white', width=2)
+                        )
+                    )
+                ]
+            )
+            fig_pie.update_layout(
+                title="Spending Distribution",
+                showlegend=True,
+                margin=dict(t=40, l=10, r=10, b=10)
+            )
+            if PLOTLY_EVENTS_AVAILABLE:
+                selected_points = plotly_events(
+                    fig_pie,
+                    click_event=True,
+                    hover_event=False,
+                    select_event=False,
+                    key='spending_category_pie_events'
+                )
+
+                if selected_points:
+                    point_index = selected_points[0].get('pointNumber')
+                    if point_index is not None and 0 <= point_index < len(category_names):
+                        _show_category_items_modal(category_names[point_index], result['transactions'])
+            else:
+                st.plotly_chart(fig_pie, use_container_width=True)
+                st.caption("Install 'streamlit-plotly-events' to enable click-to-open category modal.")
         
         with chart_col2:
             st.subheader("📈 Category Breakdown")
@@ -308,7 +448,7 @@ def display_results(result: dict):
             fig_bar.update_traces(texttemplate='$%{text:.0f}', textposition='outside')
             fig_bar.update_layout(showlegend=False)
             st.plotly_chart(fig_bar, use_container_width=True)
-    
+
     # Insights sections
     insight_col1, insight_col2 = st.columns(2)
     
@@ -329,31 +469,106 @@ def display_results(result: dict):
     # Transaction details (expandable)
     with st.expander("📋 View All Transactions", expanded=False):
         if result['transactions']:
-            # Convert to DataFrame
-            df_transactions = pd.DataFrame([
-                {
-                    'Date': txn['date'],
-                    'Description': txn['description'][:40] + ('...' if len(txn['description']) > 40 else ''),
-                    'Category': txn['category'].replace('_', ' ').title(),
-                    'Amount': txn['amount'],
-                    'Type': 'OUT' if txn['is_debit'] else 'IN',
-                    'Confidence': f"{txn['confidence']:.0%}",
-                    'Source': txn['source'].title()
-                }
-                for txn in result['transactions']
-            ])
-            
-            st.dataframe(
+            st.caption("You can edit categories for any row. Then click 'Update report' to recalculate metrics, charts, and LLM insights.")
+
+            df_transactions = _transactions_to_editor_df(result['transactions'])
+            category_labels = [_category_code_to_label(code) for code in CATEGORY_CODES if code != 'uncategorized']
+
+            edited_df = st.data_editor(
                 df_transactions,
                 use_container_width=True,
+                hide_index=True,
+                key='transactions_editor',
                 column_config={
-                    'Amount': st.column_config.NumberColumn(
-                        'Amount',
-                        format='$%.2f'
-                    ),
-                    'Date': st.column_config.DateColumn('Date'),
+                    '_txn_index': None,
+                    'Amount': st.column_config.NumberColumn('Amount', format='$%.2f', disabled=True),
+                    'Date': st.column_config.TextColumn('Date', disabled=True),
+                    'Description': st.column_config.TextColumn('Description', disabled=True),
+                    'Type': st.column_config.TextColumn('Type', disabled=True),
+                    'Confidence': st.column_config.TextColumn('Confidence', disabled=True),
+                    'Source': st.column_config.TextColumn('Source', disabled=True),
+                    'Category': st.column_config.SelectboxColumn('Category', options=category_labels, required=True)
                 }
             )
+
+            if st.button("🔄 Update report with manual categories", type="secondary", use_container_width=True):
+                _apply_manual_category_updates(result, edited_df)
+
+
+def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
+    """Apply manual category edits, persist learned rules, and recompute full analysis."""
+    updated_transactions = copy.deepcopy(result['transactions'])
+    changed_rows = 0
+    rules_saved = 0
+
+    for _, row in edited_df.iterrows():
+        txn_index = int(row['_txn_index'])
+        new_category = _category_label_to_code(row['Category'])
+        old_category = updated_transactions[txn_index]['category']
+
+        updated_transactions[txn_index]['category'] = new_category
+
+        if new_category != old_category:
+            changed_rows += 1
+            saved_ok = st.session_state.analyzer.agent1.merchant_db.save_user_category_rule(
+                updated_transactions[txn_index]['description'],
+                new_category
+            )
+            if saved_ok:
+                rules_saved += 1
+
+    llm_before_calls = st.session_state.analyzer.llm.call_count
+    llm_before_cost = st.session_state.analyzer.llm.total_cost
+
+    # Reset Agent 3 counter only for this refresh run.
+    st.session_state.analyzer.agent3.llm_calls_made = 0
+    updated_analysis = st.session_state.analyzer.agent3.process(
+        updated_transactions,
+        generate_ai_insights=st.session_state.generate_ai_insights
+    )
+
+    llm_added_calls = st.session_state.analyzer.llm.call_count - llm_before_calls
+    llm_added_cost = st.session_state.analyzer.llm.total_cost - llm_before_cost
+
+    updated_result = copy.deepcopy(result)
+    updated_result['transactions'] = updated_transactions
+    updated_result['analysis'] = updated_analysis
+    updated_result['system_metrics']['total_llm_calls'] += max(llm_added_calls, 0)
+    updated_result['system_metrics']['estimated_cost'] += max(llm_added_cost, 0.0)
+    updated_result['system_metrics']['processing_time'] = datetime.now().isoformat()
+    updated_result['system_metrics']['agent_breakdown']['agent3_llm_calls'] += max(llm_added_calls, 0)
+
+    st.session_state.analysis_result = updated_result
+
+    st.success(
+        f"Updated report with {changed_rows} manual category change(s). "
+        f"Saved {rules_saved} learned rule(s) for future statements."
+    )
+    if llm_added_calls > 0:
+        st.info(f"LLM refresh used {llm_added_calls} additional call(s), estimated +${llm_added_cost:.4f}.")
+
+    st.rerun()
+
+
+def show_debug_diagnostics(result: dict):
+    """Show parser diagnostics to help troubleshoot unsupported PDF formats."""
+    debug_data = result.get('document_debug') or result.get('debug_info') or {}
+
+    parsing_stats = debug_data.get('parsing_stats') or debug_data.get('document_processing', {}).get('parsing_stats')
+    lines = debug_data.get('sample_transaction_lines') or debug_data.get('document_processing', {}).get('raw_transaction_lines', [])[:10]
+
+    if not parsing_stats and not lines:
+        return
+
+    with st.expander("🛠️ Parser Diagnostics", expanded=False):
+        if parsing_stats:
+            st.write("**Parsing stats**")
+            st.json(parsing_stats)
+
+        if lines:
+            st.write("**Detected transaction-like lines (sample)**")
+            for line in lines:
+                st.code(line)
 
 if __name__ == "__main__":
     main()

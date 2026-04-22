@@ -221,7 +221,7 @@ class AnalysisGeneratorAgent(BaseAgent):
         if not self.llm:
             return None
         
-        # Prepare data for Claude
+        # Prepare data for the LLM
         analysis_data = {
             'spending_summary': summary,
             'top_categories': category_analysis[:5],  # Top 5 categories

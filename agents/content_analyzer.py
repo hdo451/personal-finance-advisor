@@ -2,7 +2,7 @@
 Agent 2: Content Analyzer - Smart categorization for ambiguous transactions
 ============================================================================
 
-This agent uses LLM (Claude) to categorize transactions that the 
+This agent uses an LLM (ChatGPT) to categorize transactions that the 
 deterministic approach couldn't handle.
 
 EXACTLY 1 LLM call per batch of uncategorized transactions.
@@ -69,22 +69,34 @@ class ContentAnalyzerAgent(BaseAgent):
             print("   🎉 No LLM call needed - all transactions already categorized!")
             return already_categorized
         
-        # SINGLE LLM CALL for all unclear transactions
-        print(f"   🚀 Making 1 LLM call to categorize {len(needs_llm)} transactions...")
+        print(f"   🚀 Categorizing {len(needs_llm)} transactions with LLM...")
+        before_calls = self.llm.call_count
         llm_categorized = self._batch_categorize_with_llm(needs_llm)
-        self.llm_calls_made += 1
+        used_calls = self.llm.call_count - before_calls
+        self.llm_calls_made += max(used_calls, 0)
         
-        print(f"   ✅ LLM categorization complete!")
+        print(f"   ✅ LLM categorization complete! Calls used: {used_calls}")
         
         return already_categorized + llm_categorized
     
     def _batch_categorize_with_llm(self, transactions: List[Dict]) -> List[Dict]:
         """
-        Use Claude to categorize unclear transactions in ONE call
+        Use LLM to categorize unclear transactions in ONE call
         This is the only LLM call in Agent 2
         """
-        
-        # Prepare batch data for Claude
+        # Chunk large batches to prevent truncated JSON and fallback-to-other scenarios.
+        chunk_size = 40
+        categorized_all = []
+
+        for start in range(0, len(transactions), chunk_size):
+            chunk = transactions[start:start + chunk_size]
+            categorized_chunk = self._categorize_chunk_with_llm(chunk)
+            categorized_all.extend(categorized_chunk)
+
+        return categorized_all
+
+    def _categorize_chunk_with_llm(self, transactions: List[Dict]) -> List[Dict]:
+        """Categorize one chunk of transactions through the LLM."""
         transaction_data = []
         for i, txn in enumerate(transactions):
             transaction_data.append({
@@ -94,9 +106,8 @@ class ContentAnalyzerAgent(BaseAgent):
                 'is_debit': txn['is_debit'],
                 'date': txn['date']
             })
-        
-        # Create comprehensive prompt for Claude
-        system_prompt = f"""You are a financial transaction categorizer. 
+
+        system_prompt = f"""You are a financial transaction categorizer.
         
 Categorize transactions into these categories ONLY:
 {json.dumps(self.valid_categories, indent=2)}
@@ -111,14 +122,13 @@ Return ONLY valid JSON with this exact structure:
 {{"categorizations": [{{"transaction_id": "txn_0", "category": "food_dining", "confidence": 0.85, "reasoning": "Coffee shop purchase"}}]}}"""
 
         user_prompt = f"Categorize these unclear transactions:\n{json.dumps(transaction_data, indent=2)}"
-        
+
         try:
-            # Make the LLM call
-            response = self.llm.make_call(user_prompt, system_prompt)
+            response = self.llm.make_call(user_prompt, system_prompt, expect_json=True)
             
             if response:
-                # Validate response structure using Pydantic
-                result = BatchCategorizationResponse(**json.loads(response))
+                parsed_json = self._extract_json_object(response)
+                result = BatchCategorizationResponse(**parsed_json)
                 return self._apply_llm_categorization(transactions, result.categorizations)
             else:
                 print("   ❌ LLM call failed - applying fallback categorization")
@@ -129,7 +139,7 @@ Return ONLY valid JSON with this exact structure:
             return self._apply_fallback_categorization(transactions)
     
     def _apply_llm_categorization(self, transactions: List[Dict], categorizations: List[TransactionCategory]) -> List[Dict]:
-        """Apply Claude's categorizations to transactions"""
+        """Apply LLM categorizations to transactions"""
         
         # Create lookup dict for fast matching
         cat_lookup = {cat.transaction_id: cat for cat in categorizations}
@@ -151,6 +161,28 @@ Return ONLY valid JSON with this exact structure:
                 txn['reasoning'] = 'LLM response incomplete'
         
         return transactions
+
+    def _extract_json_object(self, response_text: str) -> Dict:
+        """Extract JSON safely even if model wraps it with extra text or markdown fences."""
+        cleaned = response_text.strip()
+
+        # Direct parse first
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            pass
+
+        # Strip markdown fences if present
+        fenced_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", cleaned, re.DOTALL)
+        if fenced_match:
+            return json.loads(fenced_match.group(1))
+
+        # Fallback: first JSON object in text
+        obj_match = re.search(r"(\{.*\})", cleaned, re.DOTALL)
+        if obj_match:
+            return json.loads(obj_match.group(1))
+
+        raise ValueError("No valid JSON object found in LLM response")
     
     def _apply_fallback_categorization(self, transactions: List[Dict]) -> List[Dict]:
         """Fallback when LLM completely fails"""
