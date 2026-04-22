@@ -237,8 +237,12 @@ def _infer_problem_type(payload: dict) -> str:
     return ""
 
 
-def _apply_financial_defaults(payload: dict, source_question: str = "") -> dict:
-    """Inject explicit defaults so deterministic calculations can always proceed."""
+def _apply_financial_defaults(payload: dict) -> dict:
+    """Inject explicit defaults so deterministic calculations can always proceed.
+
+    IMPORTANT: This function must be a pure transformation of the authorized JSON.
+    The same JSON input must always produce the same normalized payload.
+    """
     normalized = copy.deepcopy(payload)
     normalized.setdefault("inputs", {})
     normalized.setdefault("defaults_used", [])
@@ -246,8 +250,6 @@ def _apply_financial_defaults(payload: dict, source_question: str = "") -> dict:
     normalized.setdefault("day_basis", 365)
     normalized.setdefault("periodicity", "monthly")
     normalized.setdefault("currency", "USD")
-
-    question_text = (source_question or "").lower()
 
     def add_default(note: str):
         if note not in normalized["defaults_used"]:
@@ -258,7 +260,15 @@ def _apply_financial_defaults(payload: dict, source_question: str = "") -> dict:
             container["rate"] = default_rate
             add_default(note)
 
-    def ensure_common_loan_fields(container: dict, card_hint: bool = False):
+    def _container_text(container: dict) -> str:
+        return " ".join(str(v) for v in container.values()).lower()
+
+    def _is_card_context(container: dict) -> bool:
+        text = _container_text(container)
+        return any(token in text for token in ["tarjeta", "credit card", "tc", "card"])
+
+    def ensure_common_loan_fields(container: dict):
+        card_hint = _is_card_context(container)
         ensure_rate(
             container,
             0.35 if card_hint else 0.10,
@@ -319,29 +329,26 @@ def _apply_financial_defaults(payload: dict, source_question: str = "") -> dict:
 
     elif ptype == "loan_payment":
         normalized["inputs"].update({k: v for k, v in normalized.items() if k in ["principal", "rate", "rate_type", "periods", "method"]})
-        card_hint = any(token in question_text for token in ["tarjeta", "credit card", "tc", "tarjeta de credito", "tarjeta de crédito"])
-        ensure_common_loan_fields(normalized["inputs"], card_hint=card_hint)
+        ensure_common_loan_fields(normalized["inputs"])
 
     elif ptype == "compare_loans":
         loans = normalized["inputs"].get("loans") or normalized.get("loans") or []
         for loan in loans:
-            card_hint = any(token in f"{loan.get('name', '')} {loan.get('method', '')} {source_question}".lower() for token in ["tarjeta", "credit card", "tc"])
-            ensure_common_loan_fields(loan, card_hint=card_hint)
+            ensure_common_loan_fields(loan)
         normalized["inputs"]["loans"] = loans
 
     elif ptype == "refinance":
         current_loan = normalized["inputs"].get("current_loan") or normalized.get("current_loan") or {}
         proposed_loan = normalized["inputs"].get("proposed_loan") or normalized.get("proposed_loan") or {}
-        ensure_common_loan_fields(current_loan, card_hint=any(token in f"{current_loan.get('name', '')} {source_question}".lower() for token in ["tarjeta", "credit card", "tc"]))
-        ensure_common_loan_fields(proposed_loan, card_hint=any(token in f"{proposed_loan.get('name', '')} {source_question}".lower() for token in ["tarjeta", "credit card", "tc"]))
+        ensure_common_loan_fields(current_loan)
+        ensure_common_loan_fields(proposed_loan)
         normalized["inputs"]["current_loan"] = current_loan
         normalized["inputs"]["proposed_loan"] = proposed_loan
 
     elif ptype == "debt_structures":
         structures = normalized["inputs"].get("structures") or normalized.get("structures") or []
         for structure in structures:
-            card_hint = any(token in f"{structure.get('name', '')} {source_question}".lower() for token in ["tarjeta", "credit card", "tc"])
-            ensure_common_loan_fields(structure, card_hint=card_hint)
+            ensure_common_loan_fields(structure)
         normalized["inputs"]["structures"] = structures
 
     elif ptype == "debt_payment_alternatives":
@@ -350,7 +357,7 @@ def _apply_financial_defaults(payload: dict, source_question: str = "") -> dict:
         normalized["inputs"].setdefault("rate_type", normalized.get("rate_type", "effective_annual"))
         normalized["inputs"].setdefault("periods", normalized.get("periods"))
         normalized["inputs"].setdefault("extra_payment", normalized.get("extra_payment", 0))
-        ensure_common_loan_fields(normalized["inputs"], card_hint=any(token in question_text for token in ["tarjeta", "credit card", "tc", "tarjeta de credito", "tarjeta de crédito"]))
+        ensure_common_loan_fields(normalized["inputs"])
 
     else:
         # Fallback: if the parser produced a partial loan-like payload, force a standard loan payment.
@@ -361,7 +368,7 @@ def _apply_financial_defaults(payload: dict, source_question: str = "") -> dict:
         normalized["inputs"].setdefault("periods", normalized.get("periods", 12))
         normalized["inputs"].setdefault("method", normalized.get("method", "french"))
         add_default("Tipo de problema inferido: loan_payment")
-        ensure_common_loan_fields(normalized["inputs"], card_hint=any(token in question_text for token in ["tarjeta", "credit card", "tc", "tarjeta de credito", "tarjeta de crédito"]))
+        ensure_common_loan_fields(normalized["inputs"])
 
     return normalized
 
@@ -430,8 +437,7 @@ Currency preference: {currency}
 
 
 def _solve_authorized_problem(authorized_payload: dict) -> dict:
-    source_question = st.session_state.get("problem_source_question", "")
-    deterministic_payload = _apply_financial_defaults(authorized_payload, source_question)
+    deterministic_payload = _apply_financial_defaults(authorized_payload)
     solved = solve_problem(deterministic_payload)
     solved["context"] = {
         "currency": authorized_payload.get("currency", "USD"),
