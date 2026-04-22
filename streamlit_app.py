@@ -5,6 +5,8 @@ Bank Statement Analyzer - Streamlit UI
 Beautiful web interface for your hybrid multi-agent system
 """
 
+import json
+import re
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
@@ -12,6 +14,7 @@ import pandas as pd
 from datetime import datetime
 import os
 import copy
+from pathlib import Path
 from dotenv import load_dotenv
 
 try:
@@ -22,6 +25,8 @@ except ImportError:
 
 # Import your system
 from main_coordinator import BankStatementAnalyzer
+
+KNOWLEDGE_BASE_PATH = Path(__file__).resolve().parent / "data" / "advisory_knowledge_base_v1.json"
 
 CATEGORY_CODES = [
     'food_dining',
@@ -76,6 +81,426 @@ def _get_category_items_for_modal(transactions: list, category_label: str) -> li
 
     return category_items
 
+
+@st.cache_data(show_spinner=False)
+def _load_knowledge_base() -> dict:
+    with open(KNOWLEDGE_BASE_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _extract_json_response(response_text: str) -> dict:
+    cleaned = response_text.strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", cleaned, re.DOTALL)
+    if fenced:
+        return json.loads(fenced.group(1))
+
+    match = re.search(r"(\{.*\})", cleaned, re.DOTALL)
+    if match:
+        return json.loads(match.group(1))
+
+    raise ValueError("No valid JSON found in response")
+
+
+def _build_meta_analysis_payload(result: dict) -> dict:
+    analysis = result['analysis']
+    return {
+        'financial_summary': analysis['financial_summary'],
+        'category_breakdown': analysis['category_breakdown'],
+        'spending_patterns': analysis['spending_patterns'],
+        'basic_insights': analysis['basic_insights'],
+        'transactions': [
+            {
+                'date': txn['date'],
+                'description': txn['description'],
+                'category': txn['category'],
+                'amount': txn['amount'],
+                'is_debit': txn['is_debit'],
+                'confidence': txn['confidence'],
+                'source': txn['source']
+            }
+            for txn in result['transactions']
+        ]
+    }
+
+
+def _run_meta_analysis(result: dict) -> dict:
+    knowledge_base = _load_knowledge_base()
+    payload = _build_meta_analysis_payload(result)
+    compact_knowledge_base = json.dumps(knowledge_base, ensure_ascii=False, separators=(',', ':'))
+
+    system_prompt = f"""You are the second-stage meta advisory engine for a personal finance system.
+Use the knowledge base below as the primary policy and evaluation source.
+
+Rules:
+- Do not invent data.
+- Do not infer income, debt capacity, or intent without explicit evidence.
+- Prioritize prudence and risk reduction when uncertainty exists.
+- Return ONLY valid JSON matching the output contract in the knowledge base.
+- Every recommendation must include evidence.
+
+Knowledge base:
+{compact_knowledge_base}
+"""
+
+    user_prompt = f"""Run a second-stage meta analysis over the fully categorized statement after human review.
+Use the reviewed transactions and the base analysis context.
+
+Base analysis context:
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+"""
+
+    llm = st.session_state.analyzer.llm
+    calls_before = llm.call_count
+    cost_before = llm.total_cost
+
+    try:
+        response = llm.make_call(user_prompt, system_prompt, expect_json=True)
+    except RuntimeError as e:
+        print(f"First JSON call failed: {e}. Retrying without JSON mode limit...")
+        response = None
+        
+    if not response:
+        retry_system_prompt = system_prompt + "\nIf you cannot use JSON mode, still return only valid JSON and no markdown."
+        response = llm.make_call(user_prompt, retry_system_prompt, expect_json=False)
+        
+    if not response:
+        raise ValueError("Meta analysis LLM call failed. Could not obtain response from OpenAI.")
+
+    meta_result = _extract_json_response(response)
+
+    calls_used = llm.call_count - calls_before
+    cost_used = llm.total_cost - cost_before
+
+    return {
+        'result': meta_result,
+        'metrics': {
+            'llm_calls': max(calls_used, 0),
+            'estimated_cost': max(cost_used, 0.0),
+            'base_cost': result['system_metrics']['estimated_cost'],
+            'total_cost': result['system_metrics']['estimated_cost'] + max(cost_used, 0.0)
+        },
+        'timestamp': datetime.now().isoformat(),
+        'source_signature': result['analysis']['report_generated_at']
+    }
+
+
+def _clear_meta_analysis_state():
+    st.session_state.meta_analysis_result = None
+    st.session_state.meta_analysis_metrics = None
+    st.session_state.meta_analysis_error = None
+    st.session_state.meta_analysis_source = None
+
+
+def _generate_executive_summary(result: dict, income: float, expenses: float, savings: float, savings_rate: float, health_status: str) -> str:
+    """Generate a professional narrative executive summary"""
+    
+    categories = result.get('category_analysis', [])
+    ratios = result.get('ratios', {})
+    
+    # Calculate category totals
+    fixed_categories = ['bills_utilities', 'fees']
+    variable_categories = ['groceries', 'transportation']
+    
+    total_fixed = 0
+    total_variable = 0
+    total_discretionary = 0
+    
+    for cat in categories:
+        cat_name = cat.get('category', '')
+        spent = cat.get('spent', 0)
+        
+        if cat_name in fixed_categories:
+            total_fixed += spent
+        elif cat_name in variable_categories:
+            total_variable += spent
+        else:
+            total_discretionary += spent
+    
+    fixed_pct = (total_fixed / expenses * 100) if expenses > 0 else 0
+    variable_pct = (total_variable / expenses * 100) if expenses > 0 else 0
+    discretionary_pct = (total_discretionary / expenses * 100) if expenses > 0 else 0
+    
+    # Build narrative
+    summary = []
+    
+    # Opening
+    if health_status == "good":
+        summary.append("**Situación Financiera General:** Tu perfil financiero muestra una posición sólida y estable. "
+                      "Con ingresos mensuales de ${:.2f} y gastos de ${:.2f}, logras un ahorro neto de ${:.2f} "
+                      "(equivalente al {:.1f}% de tus ingresos), lo que te posiciona en una trayectoria de crecimiento patrimonial."
+                      .format(income, expenses, savings, savings_rate * 100))
+    elif health_status == "risk":
+        summary.append("**Situación Financiera General:** Tu perfil financiero requiere atención inmediata. "
+                      "Actualmente gastas ${:.2f} de cada ${:.2f} que ganas, dejando tan solo ${:.2f} de ahorro mensual ({:.1f}%). "
+                      "Existen oportunidades claras de optimización que deben abordarse con urgencia."
+                      .format(expenses, income, savings, savings_rate * 100))
+    else:
+        summary.append("**Situación Financiera General:** Tu perfil financiero es neutral. "
+                      "Con ingresos de ${:.2f} y gastos de ${:.2f}, logras un ahorro de ${:.2f} ({:.1f}%). "
+                      "Hay margen para mejora en varios aspectos de tu gestión financiera."
+                      .format(income, expenses, savings, savings_rate * 100))
+    
+    # Expense breakdown narrative
+    summary.append("\n**Estructura de Gastos:** Tu gasto total se distribuye en tres categorías clave. "
+                  "Los **gastos fijos** (vivienda, servicios, seguros) representan **{:.0f}% del presupuesto** (${:.2f}), "
+                  "lo que está dentro de rangos saludables. Los **gastos variables** (alimentos, transporte) constituyen **{:.0f}%** (${:.2f}), "
+                  "reflejando necesidades cotidianas regulares. Finalmente, los **gastos discrecionales** (entretenimiento, compras, suscripciones) "
+                  "alcanzan **{:.0f}%** (${:.2f})."
+                  .format(fixed_pct, total_fixed, variable_pct, total_variable, discretionary_pct, total_discretionary))
+    
+    # Key insights
+    if discretionary_pct > 25:
+        summary.append("\n**Hallazgo Principal:** Se identifica un nivel significativo de gasto discrecional ({:.0f}%), "
+                      "lo que representa la principal área de optimización. Este segmento incluye suscripciones, compras impulsivas, "
+                      "entretenimiento y dining out. Reducir este categoría solo al 15-20% del presupuesto podría liberar "
+                      "${:.2f} adicionales mensuales para ahorros e inversión."
+                      .format(discretionary_pct, total_discretionary * 0.40))
+    elif discretionary_pct > 15:
+        summary.append("\n**Hallazgo Principal:** El gasto discrecional está en un nivel moderado ({:.0f}%). "
+                      "Aunque controlado, aún existe potencial para mejorar mediante pequeños ajustes en suscripciones "
+                      "y entretenimiento, liberando aproximadamente ${:.2f} mensuales."
+                      .format(discretionary_pct, total_discretionary * 0.25))
+    else:
+        summary.append("\n**Hallazgo Principal:** El gasto discrecional está bien controlado en {:.0f}%. "
+                      "Mantienes una disciplina sólida en áreas de discreción, lo que facilita tu capacidad de ahorro."
+                      .format(discretionary_pct))
+    
+    # Recommendations section
+    summary.append("\n**Recomendaciones Estratégicas:** Basado en este análisis, se sugieren las siguientes acciones: "
+                  "(1) Revisar la sección de **Recomendaciones** arriba para estrategias específicas; "
+                  "(2) Implementar un **presupuesto categorizado** usando la proporción 50/30/20 adaptada a tu perfil; "
+                  "(3) Automatizar transferencias de ahorro tan pronto se recibe el ingreso; "
+                  "(4) Monitorear regularmente el **Análisis de Gastos por Categoría** para detectar desviaciones temprano.")
+    
+    # Closing
+    summary.append("\n**Próximos Pasos:** Para traducir este análisis en mejoras concretas, consulta la sección de "
+                  "**Ratios Financieros** para contexto de tu posición relativa, revisa los **Problemas Detectados** "
+                  "si existen, y considera implementar las acciones listadas en **Recomendaciones**. Vuelve a generar este "
+                  "reporte mensualmente para monitorear tu progreso hacia tus objetivos financieros.")
+    
+    return "\n".join(summary)
+
+
+def _render_meta_analysis_result(meta_state: dict):
+    st.subheader("🧠 Meta Analysis Report")
+    metrics = meta_state['metrics']
+    result = meta_state['result']
+    
+    # System metrics
+    metric_col1, metric_col2, metric_col3 = st.columns(3)
+    with metric_col1:
+        st.metric("Meta LLM Calls", f"{metrics['llm_calls']}")
+    with metric_col2:
+        st.metric("Meta Cost", f"${metrics['estimated_cost']:.4f}")
+    with metric_col3:
+        st.metric("Total Cost", f"${metrics['total_cost']:.4f}")
+    
+    st.divider()
+    
+    summary = result.get('summary', {})
+    income = summary.get('income', 0)
+    expenses = summary.get('expenses', 0)
+    savings = income - expenses
+    savings_rate = summary.get('savings_rate', 0)
+    health_status = summary.get('financial_health', 'neutral')
+    
+    # 1. Resumen General
+    st.markdown("## 📊 1. Resumen General")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("💰 Ingresos", f"${income:.2f}")
+    with col2:
+        st.metric("💸 Gastos", f"${expenses:.2f}")
+    with col3:
+        st.metric("💳 Ahorro Neto", f"${savings:.2f}")
+    with col4:
+        health_emoji = {"good": "✔️", "risk": "⚠️", "critical": "🚨", "neutral": "➖"}.get(health_status, "➖")
+        st.metric(f"{health_emoji} Estado", health_status.upper())
+    
+    st.write(f"**Tasa de ahorro: {savings_rate*100:.1f}%**")
+    if savings_rate > 0.20:
+        st.success("✔️ Excelente: ahorras más de lo que gastas.")
+    elif savings_rate > 0.10:
+        st.info("✔️ Bueno: estás ahorrando regularmente.")
+    else:
+        st.warning("⚠️ Atención: necesitas aumentar tu tasa de ahorro.")
+    
+    st.divider()
+    
+    # 2. Análisis de Categorías
+    st.markdown("## 📋 2. Análisis de Gastos por Categoría")
+    categories = result.get('category_analysis', [])
+    
+    if categories:
+        # Separar en fijos, variables y discrecionales (aproximación)
+        fixed_categories = ['bills_utilities', 'fees']
+        variable_categories = ['groceries', 'transportation']
+        discretionary_categories = ['food_dining', 'shopping', 'entertainment']
+        
+        total_fixed = 0
+        total_variable = 0
+        total_discretionary = 0
+        
+        for cat in categories:
+            cat_name = cat.get('category', '')
+            spent = cat.get('spent', 0)
+            
+            if cat_name in fixed_categories:
+                total_fixed += spent
+            elif cat_name in variable_categories:
+                total_variable += spent
+            else:
+                total_discretionary += spent
+        
+        # Mostrar desglose
+        st.markdown("### 🔴 Gastos Fijos (Obligatorios)")
+        fixed_items = [c for c in categories if c.get('category', '') in fixed_categories]
+        for item in fixed_items:
+            st.write(f"• **{item.get('category', '').replace('_', ' ').title()}**: ${item.get('spent', 0):.2f}")
+        st.write(f"**Total fijos:** ${total_fixed:.2f} ({total_fixed/expenses*100:.0f}% de gastos)")
+        
+        st.markdown("### 🟡 Gastos Variables (Necesarios)")
+        variable_items = [c for c in categories if c.get('category', '') in variable_categories]
+        for item in variable_items:
+            st.write(f"• **{item.get('category', '').replace('_', ' ').title()}**: ${item.get('spent', 0):.2f}")
+        st.write(f"**Total variables:** ${total_variable:.2f} ({total_variable/expenses*100:.0f}% de gastos)")
+        
+        st.markdown("### 🔵 Gastos Discrecionales (Optimizable)")
+        discretionary_items = [c for c in categories if c.get('category', '') not in fixed_categories + variable_categories]
+        for item in discretionary_items:
+            st.write(f"• **{item.get('category', '').replace('_', ' ').title()}**: ${item.get('spent', 0):.2f}")
+        st.write(f"**Total discrecional:** ${total_discretionary:.2f} ({total_discretionary/expenses*100:.0f}% de gastos)")
+        
+        if total_discretionary / expenses > 0.25:
+            st.warning("⚠️ **Alto gasto discrecional**: Aquí está el principal potencial de optimización.")
+    
+    st.divider()
+    
+    # 3. Ratios Financieros Clave
+    st.markdown("## 🧮 3. Ratios Financieros Clave")
+    ratios = result.get('ratios', {})
+    
+    if ratios:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if 'savings_rate' in ratios:
+                sr = ratios['savings_rate'].get('value', 0)
+                st.write(f"**Tasa de Ahorro:** {sr*100:.1f}%")
+                if sr > 0.20:
+                    st.success("✔️ Muy buena (ideal >20%)")
+                elif sr > 0.10:
+                    st.info("✔️ Aceptable")
+                else:
+                    st.warning("⚠️ Por debajo del ideal")
+            
+            if 'housing_ratio' in ratios:
+                hr = ratios['housing_ratio'].get('value', 0)
+                st.write(f"**Carga de Vivienda:** {hr*100:.1f}%")
+                if hr < 0.30:
+                    st.success("✔️ Saludable (<30%)")
+                else:
+                    st.warning("⚠️ Elevado (>30%)")
+        
+        with col2:
+            if 'debt_ratio' in ratios:
+                dr = ratios['debt_ratio'].get('value', 0)
+                st.write(f"**Ratio Deuda/Ingreso:** {dr*100:.1f}%")
+                if dr < 0.15:
+                    st.success("✔️ Bajo → buena capacidad financiera")
+                else:
+                    st.warning("⚠️ Moderado a alto")
+            
+            if 'discretionary_ratio' in ratios:
+                disr = ratios['discretionary_ratio'].get('value', 0)
+                st.write(f"**Gasto Discrecional:** {disr*100:.1f}%")
+                if disr < 0.20:
+                    st.success("✔️ Controlado")
+                else:
+                    st.warning("⚠️ Elevado - oportunidad de optimización")
+    
+    st.divider()
+    
+    # 4. Problemas Detectados
+    detections = result.get('detections', [])
+    st.markdown("## ⚠️ 4. Problemas Detectados")
+    if detections:
+        for detection in detections:
+            msg = detection.get('message', detection.get('type', 'Detection'))
+            if msg and msg.strip():
+                st.write(f"• {msg}")
+    else:
+        st.info("✔️ No se detectaron problemas significativos en este análisis.")
+    
+    st.divider()
+    
+    # 5. Recomendaciones Estratégicas
+    st.markdown("## 💡 5. Recomendaciones Estratégicas")
+    recommendations = result.get('recommendations', [])
+    
+    if recommendations:
+        for idx, rec in enumerate(recommendations, 1):
+            priority = rec.get('priority', 'medium').upper()
+            priority_emoji = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(priority, "➖")
+            playbook_title = rec.get('playbook_id', 'Recomendación').replace('_', ' ').title()
+            
+            st.markdown(f"### {priority_emoji} Acción {idx}: {playbook_title}")
+            st.write(f"**Impacto estimado:** {rec.get('impact_estimate', 'N/A')}")
+            
+            actions = rec.get('actions', [])
+            if actions:
+                st.write("**Pasos a seguir:**")
+                for action in actions:
+                    st.write(f"  • {action}")
+    else:
+        st.info("No hay recomendaciones específicas en este momento.")
+    
+    st.divider()
+    
+    # 6. Conclusión
+    st.markdown("## 📈 6. Conclusión")
+    
+    if health_status == "good":
+        st.success(f"✔️ **Tu situación financiera es SALUDABLE**\n\n"
+                   f"Ingresos: ${income:.2f} | Gastos: ${expenses:.2f} | Ahorro: ${savings:.2f}\n\n"
+                   f"Estás en una buena posición. Mantén la disciplina y considera optimizar gastos discrecionales para acelerar tu acumulación de riqueza.")
+    elif health_status == "risk":
+        st.warning(f"⚠️ **Tu situación financiera requiere ATENCIÓN**\n\n"
+                   f"Ingresos: ${income:.2f} | Gastos: ${expenses:.2f} | Ahorro: ${savings:.2f}\n\n"
+                   f"Existen áreas de riesgo. Prioriza reducir gastos discrecionales e implementar las recomendaciones.")
+    else:
+        st.info(f"➖ **Tu situación financiera es NEUTRAL**\n\n"
+                f"Ingresos: ${income:.2f} | Gastos: ${expenses:.2f} | Ahorro: ${savings:.2f}\n\n"
+                f"Hay oportunidades de mejora. Revisa las recomendaciones y toma acción.")
+    
+    st.divider()
+    
+    # Data Quality
+    data_quality = result.get('data_quality', {})
+    confidence = data_quality.get('confidence', 'unknown').upper()
+    
+    st.caption(f"✓ **Confianza de datos:** {confidence} | "
+               f"⚠️ **Importante**: Este análisis debe ser revisado por un experto financiero antes de actuar.")
+    
+    st.divider()
+    
+    # Resumen Ejecutivo - Narrativa Profesional
+    st.markdown("## 📄 Resumen Ejecutivo")
+    
+    executive_summary = _generate_executive_summary(result, income, expenses, savings, savings_rate, health_status)
+    st.markdown(executive_summary)
+    
+    st.divider()
+    
+    st.caption("*Este reporte fue generado automáticamente por el sistema de asesoría financiera. "
+               "Para cambios en tus estrategias de inversión o deudas, consulta siempre con un asesor financiero profesional.*")
+
 if hasattr(st, 'dialog'):
     @st.dialog("Category Items")
     def _show_category_items_modal(category_label: str, transactions: list):
@@ -112,6 +537,9 @@ def initialize_session_state():
 
     if 'generate_ai_insights' not in st.session_state:
         st.session_state.generate_ai_insights = False
+
+    if 'meta_analysis_result' not in st.session_state:
+        _clear_meta_analysis_state()
 
 def main():
     """Main Streamlit application"""
@@ -156,7 +584,7 @@ def main():
             
             # Project info
             st.subheader("Project Details")
-            st.write("**Course**: AIasesor, finantial AI advisor")
+            st.write("Aiadvisor, AI-driven financial advisor leveraging agent-based architecture and machine learning")
             st.write("**Type**: Hybrid Multi-Agent System")
             st.caption("All responses must be validated by experts.")
             st.caption("Artifitial intellillence may not be accurate.")
@@ -297,6 +725,7 @@ def process_uploaded_file(uploaded_file, generate_insights: bool):
         if result['success']:
             st.session_state.analysis_result = result
             st.session_state.generate_ai_insights = generate_insights
+            _clear_meta_analysis_state()
             st.success("🎉 Analysis completed successfully!")
         else:
             st.error(f"❌ Analysis failed: {result['error']}")
@@ -493,6 +922,36 @@ def display_results(result: dict):
 
             if st.button("🔄 Update report with manual categories", type="secondary", use_container_width=True):
                 _apply_manual_category_updates(result, edited_df)
+
+    st.divider()
+    st.subheader("🧠 Meta Analysis")
+    st.caption("Run this only after reviewing and correcting transaction categories. This will make one additional LLM call using the knowledge base stored in data/advisory_knowledge_base_v1.json.")
+
+    meta_button_disabled = st.session_state.get('analysis_result') is None
+    if st.button("🚀 Run Meta Analysis", type="primary", use_container_width=True, disabled=meta_button_disabled):
+        try:
+            with st.spinner("Running meta analysis with knowledge base..."):
+                meta_state = _run_meta_analysis(result)
+                st.session_state.meta_analysis_result = meta_state['result']
+                st.session_state.meta_analysis_metrics = meta_state['metrics']
+                st.session_state.meta_analysis_source = meta_state['source_signature']
+                st.session_state.meta_analysis_error = None
+            st.success("Meta analysis completed successfully.")
+        except Exception as e:
+            st.session_state.meta_analysis_error = str(e)
+            st.error(f"Meta analysis failed: {e}")
+
+    meta_result = st.session_state.get('meta_analysis_result')
+    meta_source = st.session_state.get('meta_analysis_source')
+    current_source = analysis.get('report_generated_at')
+
+    if meta_result and meta_source == current_source:
+        _render_meta_analysis_result({
+            'result': meta_result,
+            'metrics': st.session_state.get('meta_analysis_metrics', {}),
+        })
+    elif st.session_state.get('meta_analysis_error'):
+        st.warning(f"Last meta analysis attempt failed: {st.session_state.meta_analysis_error}")
 
 
 def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):

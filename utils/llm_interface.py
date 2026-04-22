@@ -48,8 +48,9 @@ class LLMInterface:
             return content
         
         except Exception as e:
-            print(f"❌ OpenAI API call failed: {e}")
-            return None
+            error_msg = f"❌ OpenAI API call failed: {e}"
+            print(error_msg)
+            raise RuntimeError(error_msg)
         
     def get_metrics(self) -> Dict:
         """Report usage statistics"""

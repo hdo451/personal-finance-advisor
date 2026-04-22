@@ -11,6 +11,7 @@ Video Presentation - [Click Here](https://www.youtube.com/watch?v=kiBZ86F8_SU)*
 - [🎯 Overview](#-overview)
 - [✨ Key Features](#-key-features)
 - [🏗️ System Architecture](#️-system-architecture)
+- [🧠 Meta Analysis Layer](#-meta-analysis-layer)
 - [🚀 Quick Start](#-quick-start)
 - [💻 Usage](#-usage)
 - [📁 Project Structure](#-project-structure)
@@ -34,8 +35,11 @@ Transform PDF bank statements into comprehensive financial insights using a hybr
 🚀 **Smart PDF Processing** - Handles multiple bank formats (Chase, Wells Fargo, etc.)  
 🧠 **Hybrid Categorization** - 70% deterministic + 30% AI-powered for optimal efficiency  
 📊 **Comprehensive Analysis** - Spending patterns, category breakdowns, financial insights  
+🛠️ **Human Review Loop** - Editable transaction categories before final advanced advisory  
+🧾 **On-Demand Meta Analysis** - Second-stage advisory triggered manually with one additional LLM call  
+📚 **Knowledge-Driven Advisory** - Uses `data/advisory_knowledge_base_v1.json` for rules, benchmarks, and playbooks  
 🎨 **Beautiful Web Interface** - Professional Streamlit dashboard with interactive charts  
-💰 **Cost Optimized** - Complete analysis for ~$0.002 per statement  
+💰 **Transparent Cost Tracking** - Shows base analysis cost, incremental meta-analysis cost, and total cost  
 
 ---
 
@@ -91,8 +95,40 @@ graph TD
     ↓
 🧠 Agent 2: AI handles unclear cases (30%) → ✅ 100% categorized
     ↓  
-📊 Agent 3: Financial analysis → 💡 Insights → 🎨 Beautiful dashboard
+📊 Agent 3: Financial analysis → ✍️ Human category review (optional edits) → 🧠 Meta analysis button (optional) → 🎨 Beautiful dashboard
 ```
+
+---
+
+## 🧠 Meta Analysis Layer
+
+The software includes a second advisory layer designed to run only after human review.
+
+### How It Works
+1. Run the standard analysis pipeline (Agents 1-3).
+2. Review and adjust categories in the transaction editor.
+3. Click **Run Meta Analysis** to trigger one additional LLM call.
+4. Review a structured advisory report with:
+   - Summary metrics
+   - Category-level spend analysis
+   - Ratio interpretation
+   - Detected issues
+   - Actionable recommendations
+   - Executive summary narrative
+
+### Why It Is Safe and Non-Intrusive
+- The base workflow remains unchanged.
+- Meta analysis is **manual** (not automatic).
+- Results are tied to the current reviewed report state.
+- Advisory output explicitly warns that expert validation is required.
+
+### Cost Model
+- Base analysis: existing cost from Agent flow.
+- Meta analysis: additional incremental cost for one extra LLM call.
+- UI displays:
+  - Meta LLM calls
+  - Meta cost
+  - Total accumulated cost
 
 ---
 
@@ -130,7 +166,7 @@ streamlit run streamlit_app.py
 ```bash
 streamlit run streamlit_app.py
 ```
-Professional dashboard with drag-and-drop upload and interactive visualizations.
+Professional dashboard with drag-and-drop upload, interactive visualizations, manual category correction, and optional meta-analysis reporting.
 
 ### Command Line
 ```bash
@@ -151,13 +187,16 @@ result = analyzer.analyze_statement("statement.pdf")
 ## 📁 Project Structure
 
 ```
-bank_statement_analyzer/
+personal-finance-advisor/
 ├── streamlit_app.py              # Web interface
 ├── main_coordinator.py           # System orchestration
 ├── agents/                       # Core agents
 │   ├── document_processor.py     # Agent 1: PDF processing
 │   ├── content_analyzer.py       # Agent 2: AI categorization
 │   └── analysis_generator.py     # Agent 3: Financial analysis
+├── data/
+│   ├── user_category_rules.json          # Learned user category overrides
+│   └── advisory_knowledge_base_v1.json   # Knowledge base for meta-analysis rules/benchmarks/playbooks
 ├── utils/                        # Shared utilities
 │   ├── llm_interface.py          # AI management
 │   └── merchant_database.py      # Categorization rules
@@ -209,6 +248,12 @@ This system is designed for learning purposes and lacks production security requ
 - **Strategic AI**: Use intelligence for truly ambiguous transactions  
 - **Cost Conscious**: Batch processing minimizes API usage
 - **Reliable Foundation**: Consistent results through deterministic processing
+
+### 🧾 Advisory Governance
+
+- Meta advisory recommendations are generated from a structured knowledge base.
+- Human review is required before acting on recommendations.
+- The system separates base analysis from second-stage advisory to keep control explicit.
 
 ---
 
