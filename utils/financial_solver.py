@@ -1,0 +1,466 @@
+import math
+from datetime import datetime
+from typing import Dict, List, Tuple
+
+
+def _round2(value: float) -> float:
+    return round(float(value), 2)
+
+
+def _safe_float(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _convert_rate_to_period(rate_value: float, rate_type: str, periods_per_year: int = 12) -> float:
+    rate = _safe_float(rate_value)
+    rate_type = (rate_type or "effective_annual").lower()
+
+    if rate_type == "effective_annual":
+        return (1 + rate) ** (1 / periods_per_year) - 1
+    if rate_type == "nominal_annual":
+        return rate / periods_per_year
+    if rate_type == "effective_monthly":
+        return rate
+
+    return (1 + rate) ** (1 / periods_per_year) - 1
+
+
+def present_value(future_value: float, rate: float, periods: int) -> Dict:
+    pv = _safe_float(future_value) / ((1 + _safe_float(rate)) ** int(periods))
+    return {
+        "type": "present_value",
+        "inputs": {
+            "future_value": _safe_float(future_value),
+            "rate": _safe_float(rate),
+            "periods": int(periods),
+        },
+        "formula": "PV = FV / (1+r)^n",
+        "result": {
+            "present_value": _round2(pv),
+        },
+    }
+
+
+def future_value(present_value_amount: float, rate: float, periods: int) -> Dict:
+    fv = _safe_float(present_value_amount) * ((1 + _safe_float(rate)) ** int(periods))
+    return {
+        "type": "future_value",
+        "inputs": {
+            "present_value": _safe_float(present_value_amount),
+            "rate": _safe_float(rate),
+            "periods": int(periods),
+        },
+        "formula": "FV = PV * (1+r)^n",
+        "result": {
+            "future_value": _round2(fv),
+        },
+    }
+
+
+def amortization_french(principal: float, periodic_rate: float, periods: int) -> Tuple[float, List[Dict]]:
+    p = _safe_float(principal)
+    r = _safe_float(periodic_rate)
+    n = int(periods)
+
+    if n <= 0:
+        return 0.0, []
+
+    if r == 0:
+        payment = p / n
+    else:
+        payment = p * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
+
+    balance = p
+    schedule = []
+    for i in range(1, n + 1):
+        interest = balance * r
+        principal_paid = payment - interest
+        if i == n:
+            principal_paid = balance
+            payment = principal_paid + interest
+        balance -= principal_paid
+        schedule.append(
+            {
+                "period": i,
+                "payment": _round2(payment),
+                "interest": _round2(interest),
+                "principal": _round2(principal_paid),
+                "balance": _round2(max(balance, 0.0)),
+            }
+        )
+    return payment, schedule
+
+
+def amortization_german(principal: float, periodic_rate: float, periods: int) -> Tuple[List[Dict], float]:
+    p = _safe_float(principal)
+    r = _safe_float(periodic_rate)
+    n = int(periods)
+
+    if n <= 0:
+        return [], 0.0
+
+    principal_part = p / n
+    balance = p
+    schedule = []
+    total_paid = 0.0
+
+    for i in range(1, n + 1):
+        interest = balance * r
+        payment = principal_part + interest
+        if i == n:
+            principal_part = balance
+            payment = principal_part + interest
+        balance -= principal_part
+        total_paid += payment
+        schedule.append(
+            {
+                "period": i,
+                "payment": _round2(payment),
+                "interest": _round2(interest),
+                "principal": _round2(principal_part),
+                "balance": _round2(max(balance, 0.0)),
+            }
+        )
+
+    return schedule, total_paid
+
+
+def amortization_american(principal: float, periodic_rate: float, periods: int) -> Tuple[List[Dict], float]:
+    p = _safe_float(principal)
+    r = _safe_float(periodic_rate)
+    n = int(periods)
+
+    if n <= 0:
+        return [], 0.0
+
+    schedule = []
+    total_paid = 0.0
+
+    for i in range(1, n + 1):
+        interest = p * r
+        principal_paid = 0.0
+        payment = interest
+        if i == n:
+            principal_paid = p
+            payment = p + interest
+        total_paid += payment
+        schedule.append(
+            {
+                "period": i,
+                "payment": _round2(payment),
+                "interest": _round2(interest),
+                "principal": _round2(principal_paid),
+                "balance": _round2(p if i < n else 0.0),
+            }
+        )
+
+    return schedule, total_paid
+
+
+def loan_payment(problem: Dict) -> Dict:
+    principal = _safe_float(problem.get("principal"))
+    periods = int(problem.get("periods", 0))
+    rate_value = _safe_float(problem.get("rate"))
+    rate_type = problem.get("rate_type", "effective_annual")
+    method = (problem.get("method", "french") or "french").lower()
+
+    r = _convert_rate_to_period(rate_value, rate_type)
+
+    if method == "french":
+        payment, schedule = amortization_french(principal, r, periods)
+        total_paid = sum(item["payment"] for item in schedule)
+    elif method == "german":
+        schedule, total_paid = amortization_german(principal, r, periods)
+        payment = schedule[0]["payment"] if schedule else 0.0
+    else:
+        schedule, total_paid = amortization_american(principal, r, periods)
+        payment = schedule[0]["payment"] if schedule else 0.0
+
+    total_interest = total_paid - principal
+
+    return {
+        "type": "loan_payment",
+        "inputs": {
+            "principal": principal,
+            "periods": periods,
+            "rate": rate_value,
+            "rate_type": rate_type,
+            "method": method,
+            "periodic_rate_used": r,
+        },
+        "formula": "Depends on method: French/German/American amortization",
+        "result": {
+            "estimated_payment": _round2(payment),
+            "total_paid": _round2(total_paid),
+            "total_interest": _round2(total_interest),
+            "schedule_preview": schedule[:12],
+        },
+    }
+
+
+def compare_loans(problem: Dict) -> Dict:
+    loans = problem.get("loans", [])
+    results = []
+
+    for loan in loans:
+        one = loan_payment(loan)
+        results.append(
+            {
+                "name": loan.get("name", "Loan"),
+                "method": loan.get("method", "french"),
+                "estimated_payment": one["result"]["estimated_payment"],
+                "total_paid": one["result"]["total_paid"],
+                "total_interest": one["result"]["total_interest"],
+            }
+        )
+
+    winner = None
+    if results:
+        winner = min(results, key=lambda x: x["total_paid"])
+
+    return {
+        "type": "compare_loans",
+        "inputs": {
+            "loans": loans,
+        },
+        "formula": "Compare total paid and total interest across alternatives",
+        "result": {
+            "comparison": results,
+            "best_by_total_paid": winner,
+        },
+    }
+
+
+def rate_conversion(problem: Dict) -> Dict:
+    rate = _safe_float(problem.get("rate", 0.0))
+    from_type = (problem.get("from_type", "effective_annual") or "effective_annual").lower()
+
+    monthly = _convert_rate_to_period(rate, from_type)
+    effective_annual = (1 + monthly) ** 12 - 1
+    nominal_annual = monthly * 12
+
+    return {
+        "type": "rate_conversion",
+        "inputs": {
+            "rate": rate,
+            "from_type": from_type,
+            "periodicity": "monthly",
+        },
+        "formula": "Rate normalization to monthly, nominal annual, and effective annual",
+        "result": {
+            "effective_monthly": round(monthly, 6),
+            "nominal_annual": round(nominal_annual, 6),
+            "effective_annual": round(effective_annual, 6),
+        },
+    }
+
+
+def refinance(problem: Dict) -> Dict:
+    current = problem.get("current_loan", {})
+    proposed = problem.get("proposed_loan", {})
+
+    current_result = loan_payment(current)
+    proposed_result = loan_payment(proposed)
+
+    current_total = _safe_float(current_result["result"]["total_paid"])
+    proposed_total = _safe_float(proposed_result["result"]["total_paid"])
+
+    return {
+        "type": "refinance",
+        "inputs": {
+            "current_loan": current,
+            "proposed_loan": proposed,
+        },
+        "formula": "Compare current vs proposed total paid and monthly payment",
+        "result": {
+            "current_total_paid": _round2(current_total),
+            "proposed_total_paid": _round2(proposed_total),
+            "estimated_savings_total": _round2(current_total - proposed_total),
+            "current_payment": current_result["result"]["estimated_payment"],
+            "proposed_payment": proposed_result["result"]["estimated_payment"],
+        },
+    }
+
+
+def npv_irr(problem: Dict) -> Dict:
+    cashflows = [_safe_float(x) for x in problem.get("cashflows", [])]
+    discount_rate = _safe_float(problem.get("discount_rate", 0.0))
+
+    npv = 0.0
+    for t, cf in enumerate(cashflows):
+        npv += cf / ((1 + discount_rate) ** t)
+
+    def irr_newton(flows: List[float], guess: float = 0.1, max_iter: int = 100, tol: float = 1e-7):
+        r = guess
+        for _ in range(max_iter):
+            f = 0.0
+            df = 0.0
+            for t, cf in enumerate(flows):
+                denom = (1 + r) ** t
+                f += cf / denom
+                if t > 0:
+                    df -= t * cf / ((1 + r) ** (t + 1))
+            if abs(df) < tol:
+                break
+            new_r = r - f / df
+            if abs(new_r - r) < tol:
+                return new_r
+            r = new_r
+        return r
+
+    irr = None
+    if len(cashflows) >= 2 and any(cf < 0 for cf in cashflows) and any(cf > 0 for cf in cashflows):
+        irr = irr_newton(cashflows)
+
+    return {
+        "type": "npv_irr",
+        "inputs": {
+            "cashflows": cashflows,
+            "discount_rate": discount_rate,
+        },
+        "formula": "NPV = Σ(CFt/(1+r)^t), IRR solved iteratively",
+        "result": {
+            "npv": _round2(npv),
+            "irr": round(irr, 6) if irr is not None else None,
+        },
+    }
+
+
+def real_return(problem: Dict) -> Dict:
+    nominal_return = _safe_float(problem.get("nominal_return", 0.0))
+    inflation = _safe_float(problem.get("inflation", 0.0))
+
+    real = ((1 + nominal_return) / (1 + inflation)) - 1
+
+    return {
+        "type": "real_return",
+        "inputs": {
+            "nominal_return": nominal_return,
+            "inflation": inflation,
+        },
+        "formula": "Real return = (1+nominal)/(1+inflation)-1",
+        "result": {
+            "real_return": round(real, 6),
+        },
+    }
+
+
+def debt_structures(problem: Dict) -> Dict:
+    structures = problem.get("structures", [])
+    rows = []
+    for s in structures:
+        solved = loan_payment(s)
+        rows.append(
+            {
+                "name": s.get("name", "Structure"),
+                "payment": solved["result"]["estimated_payment"],
+                "total_paid": solved["result"]["total_paid"],
+                "total_interest": solved["result"]["total_interest"],
+            }
+        )
+
+    best = min(rows, key=lambda x: x["total_paid"]) if rows else None
+
+    return {
+        "type": "debt_structures",
+        "inputs": {
+            "structures": structures,
+        },
+        "formula": "Compares cost and burden across debt structures",
+        "result": {
+            "comparison": rows,
+            "best_structure": best,
+        },
+    }
+
+
+def debt_payment_alternatives(problem: Dict) -> Dict:
+    principal = _safe_float(problem.get("principal", 0))
+    rate_value = _safe_float(problem.get("rate", 0))
+    rate_type = problem.get("rate_type", "effective_annual")
+    planned_periods = int(problem.get("periods", 0))
+    extra_payment = _safe_float(problem.get("extra_payment", 0))
+
+    base = loan_payment(
+        {
+            "principal": principal,
+            "rate": rate_value,
+            "rate_type": rate_type,
+            "periods": planned_periods,
+            "method": "french",
+        }
+    )
+
+    periodic_rate = _convert_rate_to_period(rate_value, rate_type)
+    base_payment = _safe_float(base["result"]["estimated_payment"])
+    new_payment = base_payment + extra_payment
+
+    # Simulate faster payoff with extra payment
+    balance = principal
+    months = 0
+    total_paid = 0.0
+    while balance > 1e-9 and months < 2000:
+        months += 1
+        interest = balance * periodic_rate
+        principal_paid = max(new_payment - interest, 0.0)
+        if principal_paid > balance:
+            principal_paid = balance
+        payment = principal_paid + interest
+        balance -= principal_paid
+        total_paid += payment
+
+    return {
+        "type": "debt_payment_alternatives",
+        "inputs": {
+            "principal": principal,
+            "rate": rate_value,
+            "rate_type": rate_type,
+            "periods": planned_periods,
+            "extra_payment": extra_payment,
+        },
+        "formula": "Baseline amortization vs accelerated payment with extra monthly amount",
+        "result": {
+            "baseline_total_paid": _safe_float(base["result"]["total_paid"]),
+            "accelerated_total_paid": _round2(total_paid),
+            "baseline_periods": planned_periods,
+            "accelerated_periods": months,
+            "total_savings": _round2(_safe_float(base["result"]["total_paid"]) - total_paid),
+        },
+    }
+
+
+def solve_problem(problem: Dict) -> Dict:
+    problem_type = (problem.get("problem_type") or "").lower().strip()
+
+    solver_map = {
+        "present_value": lambda p: present_value(p.get("future_value", 0), p.get("rate", 0), p.get("periods", 0)),
+        "future_value": lambda p: future_value(p.get("present_value", 0), p.get("rate", 0), p.get("periods", 0)),
+        "loan_payment": loan_payment,
+        "compare_loans": compare_loans,
+        "rate_conversion": rate_conversion,
+        "refinance": refinance,
+        "npv_irr": npv_irr,
+        "real_return": real_return,
+        "debt_structures": debt_structures,
+        "debt_payment_alternatives": debt_payment_alternatives,
+    }
+
+    if problem_type not in solver_map:
+        raise ValueError(f"Unsupported problem_type: {problem_type}")
+
+    solved = solver_map[problem_type](problem)
+
+    return {
+        "problem_type": problem_type,
+        "timestamp": datetime.now().isoformat(),
+        "trace": {
+            "inputs": solved.get("inputs", {}),
+            "assumptions": problem.get("assumptions", []),
+            "formula": solved.get("formula", ""),
+            "result": solved.get("result", {}),
+        },
+        "result": solved.get("result", {}),
+    }

@@ -25,6 +25,7 @@ except ImportError:
 
 # Import your system
 from main_coordinator import BankStatementAnalyzer
+from utils.financial_solver import solve_problem
 
 KNOWLEDGE_BASE_PATH = Path(__file__).resolve().parent / "data" / "advisory_knowledge_base_v1.json"
 
@@ -194,6 +195,420 @@ def _clear_meta_analysis_state():
     st.session_state.meta_analysis_metrics = None
     st.session_state.meta_analysis_error = None
     st.session_state.meta_analysis_source = None
+
+
+def _clear_problem_solver_state():
+    st.session_state.problem_draft = None
+    st.session_state.problem_draft_text = ""
+    st.session_state.problem_source_question = ""
+    st.session_state.problem_solver_result = None
+    st.session_state.problem_solver_narrative = None
+    st.session_state.problem_solver_metrics = None
+    st.session_state.problem_solver_error = None
+
+
+def _infer_problem_type(payload: dict) -> str:
+    """Infer a problem type from the JSON structure when the parser is incomplete."""
+    ptype = (payload.get("problem_type") or "").lower().strip()
+    if ptype:
+        return ptype
+
+    if payload.get("current_loan") and payload.get("proposed_loan"):
+        return "refinance"
+    if payload.get("loans"):
+        return "compare_loans"
+    if payload.get("structures"):
+        return "debt_structures"
+    if payload.get("cashflows"):
+        return "npv_irr"
+    if payload.get("nominal_return") is not None or payload.get("inflation") is not None:
+        return "real_return"
+    if payload.get("extra_payment") is not None:
+        return "debt_payment_alternatives"
+    if payload.get("future_value") is not None:
+        return "present_value"
+    if payload.get("present_value") is not None:
+        return "future_value"
+    if payload.get("principal") is not None and payload.get("periods") is not None:
+        return "loan_payment"
+    if payload.get("rate") is not None:
+        return "rate_conversion"
+
+    return ""
+
+
+def _apply_financial_defaults(payload: dict, source_question: str = "") -> dict:
+    """Inject explicit defaults so deterministic calculations can always proceed."""
+    normalized = copy.deepcopy(payload)
+    normalized.setdefault("inputs", {})
+    normalized.setdefault("defaults_used", [])
+    normalized.setdefault("assumptions", [])
+    normalized.setdefault("day_basis", 365)
+    normalized.setdefault("periodicity", "monthly")
+    normalized.setdefault("currency", "USD")
+
+    question_text = (source_question or "").lower()
+
+    def add_default(note: str):
+        if note not in normalized["defaults_used"]:
+            normalized["defaults_used"].append(note)
+
+    def ensure_rate(container: dict, default_rate: float, note: str):
+        if container.get("rate") in [None, "", 0, "0"]:
+            container["rate"] = default_rate
+            add_default(note)
+
+    def ensure_common_loan_fields(container: dict, card_hint: bool = False):
+        ensure_rate(
+            container,
+            0.35 if card_hint else 0.10,
+            "Tasa de tarjeta de crédito asumida: 35% anual" if card_hint else "Tasa financiera asumida: 10% anual",
+        )
+        if container.get("rate_type") in [None, ""]:
+            container["rate_type"] = "effective_annual"
+            add_default("Tipo de tasa asumido: efectiva anual")
+        if container.get("periods") in [None, "", 0, "0"]:
+            container["periods"] = 12
+            add_default("Plazo asumido: 12 periodos mensuales")
+        if container.get("method") in [None, ""]:
+            container["method"] = "french"
+            add_default("Método de amortización asumido: francés")
+
+    normalized["problem_type"] = _infer_problem_type(normalized)
+    ptype = normalized["problem_type"]
+
+    if ptype in ["present_value", "future_value", "rate_conversion", "real_return", "npv_irr"]:
+        if ptype == "present_value":
+            normalized["inputs"].setdefault("future_value", normalized.get("future_value"))
+            normalized["inputs"].setdefault("periods", normalized.get("periods"))
+            normalized["inputs"].setdefault("rate", normalized.get("rate"))
+        elif ptype == "future_value":
+            normalized["inputs"].setdefault("present_value", normalized.get("present_value"))
+            normalized["inputs"].setdefault("periods", normalized.get("periods"))
+            normalized["inputs"].setdefault("rate", normalized.get("rate"))
+
+        if ptype == "rate_conversion":
+            normalized["inputs"].setdefault("rate", normalized.get("rate"))
+            normalized["inputs"].setdefault("from_type", normalized.get("from_type", "effective_annual"))
+        elif ptype == "real_return":
+            normalized["inputs"].setdefault("nominal_return", normalized.get("nominal_return"))
+            normalized["inputs"].setdefault("inflation", normalized.get("inflation"))
+        elif ptype == "npv_irr":
+            normalized["inputs"].setdefault("cashflows", normalized.get("cashflows", []))
+            normalized["inputs"].setdefault("discount_rate", normalized.get("discount_rate"))
+
+        if normalized["inputs"].get("rate") in [None, "", 0, "0"]:
+            normalized["inputs"]["rate"] = 0.10
+            add_default("Tasa financiera asumida: 10% anual")
+
+        if ptype in ["present_value", "future_value"] and normalized["inputs"].get("periods") in [None, "", 0, "0"]:
+            normalized["inputs"]["periods"] = 12
+            add_default("Plazo asumido: 12 periodos")
+
+        if ptype == "npv_irr" and normalized["inputs"].get("discount_rate") in [None, "", 0, "0"]:
+            normalized["inputs"]["discount_rate"] = 0.10
+            add_default("Tasa de descuento asumida: 10% anual")
+
+        if ptype == "real_return":
+            if normalized["inputs"].get("nominal_return") in [None, "", 0, "0"]:
+                normalized["inputs"]["nominal_return"] = 0.10
+                add_default("Rentabilidad nominal asumida: 10% anual")
+            if normalized["inputs"].get("inflation") in [None, "", 0, "0"]:
+                normalized["inputs"]["inflation"] = 0.04
+                add_default("Inflación asumida: 4% anual")
+
+    elif ptype == "loan_payment":
+        normalized["inputs"].update({k: v for k, v in normalized.items() if k in ["principal", "rate", "rate_type", "periods", "method"]})
+        card_hint = any(token in question_text for token in ["tarjeta", "credit card", "tc", "tarjeta de credito", "tarjeta de crédito"])
+        ensure_common_loan_fields(normalized["inputs"], card_hint=card_hint)
+
+    elif ptype == "compare_loans":
+        loans = normalized["inputs"].get("loans") or normalized.get("loans") or []
+        for loan in loans:
+            card_hint = any(token in f"{loan.get('name', '')} {loan.get('method', '')} {source_question}".lower() for token in ["tarjeta", "credit card", "tc"])
+            ensure_common_loan_fields(loan, card_hint=card_hint)
+        normalized["inputs"]["loans"] = loans
+
+    elif ptype == "refinance":
+        current_loan = normalized["inputs"].get("current_loan") or normalized.get("current_loan") or {}
+        proposed_loan = normalized["inputs"].get("proposed_loan") or normalized.get("proposed_loan") or {}
+        ensure_common_loan_fields(current_loan, card_hint=any(token in f"{current_loan.get('name', '')} {source_question}".lower() for token in ["tarjeta", "credit card", "tc"]))
+        ensure_common_loan_fields(proposed_loan, card_hint=any(token in f"{proposed_loan.get('name', '')} {source_question}".lower() for token in ["tarjeta", "credit card", "tc"]))
+        normalized["inputs"]["current_loan"] = current_loan
+        normalized["inputs"]["proposed_loan"] = proposed_loan
+
+    elif ptype == "debt_structures":
+        structures = normalized["inputs"].get("structures") or normalized.get("structures") or []
+        for structure in structures:
+            card_hint = any(token in f"{structure.get('name', '')} {source_question}".lower() for token in ["tarjeta", "credit card", "tc"])
+            ensure_common_loan_fields(structure, card_hint=card_hint)
+        normalized["inputs"]["structures"] = structures
+
+    elif ptype == "debt_payment_alternatives":
+        normalized["inputs"].setdefault("principal", normalized.get("principal"))
+        normalized["inputs"].setdefault("rate", normalized.get("rate"))
+        normalized["inputs"].setdefault("rate_type", normalized.get("rate_type", "effective_annual"))
+        normalized["inputs"].setdefault("periods", normalized.get("periods"))
+        normalized["inputs"].setdefault("extra_payment", normalized.get("extra_payment", 0))
+        ensure_common_loan_fields(normalized["inputs"], card_hint=any(token in question_text for token in ["tarjeta", "credit card", "tc", "tarjeta de credito", "tarjeta de crédito"]))
+
+    else:
+        # Fallback: if the parser produced a partial loan-like payload, force a standard loan payment.
+        normalized["problem_type"] = "loan_payment"
+        normalized["inputs"].setdefault("principal", normalized.get("principal", normalized["inputs"].get("principal", 0)))
+        normalized["inputs"].setdefault("rate", normalized.get("rate", normalized["inputs"].get("rate", 0.10)))
+        normalized["inputs"].setdefault("rate_type", normalized.get("rate_type", "effective_annual"))
+        normalized["inputs"].setdefault("periods", normalized.get("periods", 12))
+        normalized["inputs"].setdefault("method", normalized.get("method", "french"))
+        add_default("Tipo de problema inferido: loan_payment")
+        ensure_common_loan_fields(normalized["inputs"], card_hint=any(token in question_text for token in ["tarjeta", "credit card", "tc", "tarjeta de credito", "tarjeta de crédito"]))
+
+    return normalized
+
+
+def _interpret_problem_to_json(question: str, currency: str) -> dict:
+    llm = st.session_state.analyzer.llm
+    calls_before = llm.call_count
+    cost_before = llm.total_cost
+
+    system_prompt = """You are a financial math problem parser.
+Convert a free-form user question into a normalized JSON payload for a deterministic calculator.
+
+Supported problem_type values:
+- present_value
+- future_value
+- loan_payment
+- compare_loans
+- rate_conversion
+- refinance
+- npv_irr
+- real_return
+- debt_structures
+- debt_payment_alternatives
+
+Rules:
+- Return only valid JSON.
+- If values (like interest rates, periods) are missing, you MUST inject reasonable numeric defaults directly into the inputs (e.g., 0.35 / 35% for a credit card rate, or 0.10 for personal loans, 0.08 for mortgages).
+- You MUST document these injected assumptions specifically in the "defaults_used" array (e.g. "Tasa de tarjeta de crédito asumida: 35% anual").
+- If ambiguity exists, explain it in ambiguity_disclosure.
+- Use periodicity monthly and day_basis 365 unless user states otherwise.
+
+Required output shape:
+{
+  "problem_type": "...",
+  "currency": "MXN|USD",
+  "day_basis": 365,
+  "periodicity": "monthly",
+  "inputs": { ... },
+  "assumptions": ["..."],
+  "defaults_used": ["..."],
+  "ambiguity_disclosure": "..."
+}
+"""
+
+    user_prompt = f"""User question: {question}
+Currency preference: {currency}
+"""
+
+    response = llm.make_call(user_prompt, system_prompt, expect_json=True)
+    if not response:
+        response = llm.make_call(user_prompt, system_prompt, expect_json=False)
+    if not response:
+        raise ValueError("No se pudo interpretar la pregunta.")
+
+    parsed = _extract_json_response(response)
+
+    calls_used = llm.call_count - calls_before
+    cost_used = llm.total_cost - cost_before
+    return {
+        "draft": parsed,
+        "metrics": {
+            "llm_calls": max(calls_used, 0),
+            "estimated_cost": max(cost_used, 0.0),
+        },
+    }
+
+
+def _solve_authorized_problem(authorized_payload: dict) -> dict:
+    source_question = st.session_state.get("problem_source_question", "")
+    deterministic_payload = _apply_financial_defaults(authorized_payload, source_question)
+    solved = solve_problem(deterministic_payload)
+    solved["context"] = {
+        "currency": authorized_payload.get("currency", "USD"),
+        "periodicity": authorized_payload.get("periodicity", "monthly"),
+        "day_basis": authorized_payload.get("day_basis", 365),
+        "defaults_used": deterministic_payload.get("defaults_used", []),
+        "ambiguity_disclosure": authorized_payload.get("ambiguity_disclosure", ""),
+    }
+    solved["trace"]["assumptions"] = deterministic_payload.get("assumptions", []) + deterministic_payload.get("defaults_used", [])
+    return solved
+
+
+def _generate_problem_narrative(question: str, solved: dict) -> dict:
+    llm = st.session_state.analyzer.llm
+    calls_before = llm.call_count
+    cost_before = llm.total_cost
+
+    system_prompt = """You are a financial analyst.
+Write a concise but human-readable report in Spanish with this structure:
+1) Interpretación del problema
+2) Supuestos y defaults utilizados
+3) Pasos de cálculo (claros)
+4) Resultado principal
+5) Interpretación ejecutiva
+6) Recomendaciones accionables
+
+Rules:
+- Mention that this is educational and not regulated investment advice.
+- Do not recommend specific financial products without user profile context.
+- Always reference the deterministic results provided in the input.
+"""
+
+    user_prompt = f"""Original question:
+{question}
+
+Deterministic solution trace:
+{json.dumps(solved, ensure_ascii=False, indent=2)}
+"""
+
+    narrative = llm.make_call(user_prompt, system_prompt, expect_json=False)
+    if not narrative:
+        raise ValueError("No se pudo generar redacción ejecutiva.")
+
+    calls_used = llm.call_count - calls_before
+    cost_used = llm.total_cost - cost_before
+    return {
+        "text": narrative,
+        "metrics": {
+            "llm_calls": max(calls_used, 0),
+            "estimated_cost": max(cost_used, 0.0),
+        },
+    }
+
+
+def render_problem_solver_page():
+    st.header("🧮 Problemas cotidianos")
+    st.caption("Resuelve preguntas financieras en lenguaje natural con cálculo determinístico en Python y redacción ejecutiva asistida por LLM.")
+
+    question = st.text_area(
+        "Describe tu problema financiero",
+        placeholder="Ej: ¿Me conviene crédito A o B para comprar auto?"
+    )
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        currency = st.selectbox("Moneda", ["MXN", "USD"], index=0)
+    with col2:
+        st.text_input("Periodicidad", value="monthly", disabled=True)
+    with col3:
+        st.text_input("Base de días", value="365", disabled=True)
+
+    if st.button("🧠 Interpretar problema", type="secondary", use_container_width=True):
+        if not question.strip():
+            st.warning("Escribe una pregunta antes de interpretar.")
+        else:
+            try:
+                with st.spinner("Interpretando y ordenando datos..."):
+                    parsed = _interpret_problem_to_json(question.strip(), currency)
+                    st.session_state.problem_source_question = question.strip()
+                    st.session_state.problem_draft = parsed["draft"]
+                    st.session_state.problem_draft_text = json.dumps(parsed["draft"], ensure_ascii=False, indent=2)
+                    st.session_state.problem_solver_metrics = {
+                        "parse_llm_calls": parsed["metrics"]["llm_calls"],
+                        "parse_cost": parsed["metrics"]["estimated_cost"],
+                        "narrative_llm_calls": 0,
+                        "narrative_cost": 0.0,
+                    }
+                    st.session_state.problem_solver_error = None
+            except Exception as e:
+                st.session_state.problem_solver_error = str(e)
+
+    if st.session_state.get("problem_draft_text"):
+        st.subheader("📋 Datos reordenados (requiere autorización humana)")
+        st.caption("Revisa y edita el JSON antes de resolver. El cálculo solo corre cuando autorizas.")
+
+        draft_dict = st.session_state.get("problem_draft", {})
+        defaults_used = draft_dict.get("defaults_used", [])
+        
+        if defaults_used:
+            defaults_markdown = "".join([
+                f"<li style='margin-bottom: 8px;'><span style='color:#b00020; font-weight:700;'>{d}</span></li>"
+                for d in defaults_used
+            ])
+            st.markdown(
+                f"""
+                <div style="background-color: #fff0f0; border: 2px solid #d32f2f; color: #b00020; padding: 16px; border-radius: 8px; margin-bottom: 15px;">
+                    <strong style="font-size: 1.05rem;">⚠️ ATENCIÓN - DATOS ASUMIDOS AUTOMÁTICAMENTE:</strong><br>
+                    <span style="font-weight: 700;">El problema no contenía toda la información necesaria.</span>
+                    Se inyectaron estos supuestos para poder calcular. Revisa cada uno y modifícalo si deseas trabajar con otro valor:<br><br>
+                    <ul style="margin-top: 8px; margin-bottom: 0; padding-left: 22px;">
+                        {defaults_markdown}
+                    </ul>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        edited = st.text_area(
+            "JSON autorizado",
+            value=st.session_state.problem_draft_text,
+            height=360,
+            key="problem_solver_json_editor",
+        )
+
+        if st.button("✅ Autorizar y resolver", type="primary", use_container_width=True):
+            try:
+                authorized_payload = json.loads(edited)
+                solved = _solve_authorized_problem(authorized_payload)
+                narrative = _generate_problem_narrative(question.strip(), solved)
+
+                metrics = st.session_state.problem_solver_metrics or {
+                    "parse_llm_calls": 0,
+                    "parse_cost": 0.0,
+                    "narrative_llm_calls": 0,
+                    "narrative_cost": 0.0,
+                }
+                metrics["narrative_llm_calls"] = narrative["metrics"]["llm_calls"]
+                metrics["narrative_cost"] = narrative["metrics"]["estimated_cost"]
+                metrics["total_llm_calls"] = metrics["parse_llm_calls"] + metrics["narrative_llm_calls"]
+                metrics["total_cost"] = metrics["parse_cost"] + metrics["narrative_cost"]
+
+                st.session_state.problem_solver_result = solved
+                st.session_state.problem_solver_narrative = narrative["text"]
+                st.session_state.problem_solver_metrics = metrics
+                st.session_state.problem_solver_error = None
+            except Exception as e:
+                st.session_state.problem_solver_error = str(e)
+
+    if st.session_state.get("problem_solver_error"):
+        st.error(f"Error en resolución: {st.session_state.problem_solver_error}")
+
+    solved = st.session_state.get("problem_solver_result")
+    if solved:
+        metrics = st.session_state.get("problem_solver_metrics", {})
+
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("LLM interpretación", metrics.get("parse_llm_calls", 0), f"${metrics.get('parse_cost', 0.0):.4f}")
+        with m2:
+            st.metric("LLM redacción", metrics.get("narrative_llm_calls", 0), f"${metrics.get('narrative_cost', 0.0):.4f}")
+        with m3:
+            st.metric("Costo total etapa", f"{metrics.get('total_llm_calls', 0)} calls", f"${metrics.get('total_cost', 0.0):.4f}")
+
+        st.subheader("🧾 Trazabilidad")
+        st.json(
+            {
+                "inputs": solved.get("trace", {}).get("inputs", {}),
+                "assumptions": solved.get("trace", {}).get("assumptions", []),
+                "formula": solved.get("trace", {}).get("formula", ""),
+                "result": solved.get("trace", {}).get("result", {}),
+                "timestamp": solved.get("timestamp"),
+            }
+        )
+
+        st.subheader("📄 Respuesta ejecutiva")
+        st.markdown(st.session_state.get("problem_solver_narrative", ""))
+        st.caption("Supuestos y defaults usados están documentados en la trazabilidad superior.")
 
 
 def _generate_executive_summary(result: dict, income: float, expenses: float, savings: float, savings_rate: float, health_status: str) -> str:
@@ -541,6 +956,9 @@ def initialize_session_state():
     if 'meta_analysis_result' not in st.session_state:
         _clear_meta_analysis_state()
 
+    if 'problem_draft' not in st.session_state:
+        _clear_problem_solver_state()
+
 def main():
     """Main Streamlit application"""
     
@@ -593,10 +1011,22 @@ def main():
         else:
             st.error("❌ System initialization failed")
             st.write("Please check your .env file contains OPENAI_API_KEY")
+
+        st.divider()
+        workspace_mode = st.radio(
+            "Módulo",
+            ["Análisis de cartola", "Problemas cotidianos"],
+            index=0,
+            help="Selecciona entre análisis de estados de cuenta y resolución de problemas financieros cotidianos"
+        )
     
     # Main content area
     if not st.session_state.analyzer:
         st.error("System not initialized. Please check your API key configuration.")
+        return
+
+    if workspace_mode == "Problemas cotidianos":
+        render_problem_solver_page()
         return
     
     # File upload section
