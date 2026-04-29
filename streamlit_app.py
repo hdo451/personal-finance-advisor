@@ -1849,18 +1849,20 @@ def main():
     st.title("🏦 Bank Statement Analyzer")
     st.subheader("Hybrid Multi-Agent Financial Analysis System")
     
-    # Educational warning
-    st.warning("⚠️ **Educational Project Only** - Do not use with real financial data containing sensitive information")
-    
-    # Module selection - Main page
+    # Module selection - FIRST visible element
+    st.info("👇 **Selecciona un módulo para comenzar:**")
     workspace_mode = st.radio(
         "Módulo",
         ["Análisis de cartola", "Problemas cotidianos"],
         index=0,
+        horizontal=True,
         help="Selecciona entre análisis de estados de cuenta y resolución de problemas financieros cotidianos"
     )
     
     st.divider()
+    
+    # Educational warning
+    st.warning("⚠️ **Educational Project Only** - Do not use with real financial data containing sensitive information")
     
     # Sidebar - System Information
     with st.sidebar:
