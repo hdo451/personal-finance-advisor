@@ -1852,6 +1852,16 @@ def main():
     # Educational warning
     st.warning("⚠️ **Educational Project Only** - Do not use with real financial data containing sensitive information")
     
+    # Module selection - Main page
+    workspace_mode = st.radio(
+        "Módulo",
+        ["Análisis de cartola", "Problemas cotidianos"],
+        index=0,
+        help="Selecciona entre análisis de estados de cuenta y resolución de problemas financieros cotidianos"
+    )
+    
+    st.divider()
+    
     # Sidebar - System Information
     with st.sidebar:
         st.header("🤖 System Status")
@@ -1883,14 +1893,6 @@ def main():
         else:
             st.error("❌ System initialization failed")
             st.write("Please check your .env file contains OPENAI_API_KEY")
-
-        st.divider()
-        workspace_mode = st.radio(
-            "Módulo",
-            ["Análisis de cartola", "Problemas cotidianos"],
-            index=0,
-            help="Selecciona entre análisis de estados de cuenta y resolución de problemas financieros cotidianos"
-        )
     
     # Main content area
     if not st.session_state.analyzer:
