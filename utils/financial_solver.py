@@ -234,6 +234,90 @@ def compare_loans(problem: Dict) -> Dict:
     }
 
 
+def compare_asset_options(problem: Dict) -> Dict:
+    inputs = problem.get("inputs", {}) or {}
+    options = problem.get("options", inputs.get("options", [])) or []
+    annual_discount_rate = _safe_float(problem.get("discount_rate", inputs.get("discount_rate", 0.0)))
+    horizon_months = int(problem.get("horizon_months", inputs.get("horizon_months", 48)))
+    periodic_discount_rate = _convert_rate_to_period(annual_discount_rate, problem.get("rate_type", inputs.get("rate_type", "effective_annual")))
+
+    results = []
+    for option in options:
+        name = option.get("name", "Opción")
+        option_type = (option.get("option_type") or "purchase").lower().strip()
+        upfront_payment = _safe_float(option.get("upfront_payment", option.get("purchase_price", 0.0)))
+        monthly_payment = _safe_float(option.get("monthly_payment", 0.0))
+        term_months = int(option.get("term_months", horizon_months) or horizon_months)
+        residual_value = _safe_float(option.get("residual_value", 0.0))
+        maintenance_monthly = _safe_float(option.get("maintenance_monthly", 0.0))
+        maintenance_included = bool(option.get("maintenance_included", False))
+        lease_purchase_enabled = bool(option.get("lease_purchase_enabled", False))
+        lease_purchase_price = _safe_float(option.get("lease_purchase_price", 0.0))
+        residual_timing_months = int(option.get("residual_timing_months", term_months or horizon_months))
+
+        pv_cost = upfront_payment
+        for month in range(1, horizon_months + 1):
+            discount_factor = (1 + periodic_discount_rate) ** month
+
+            if monthly_payment > 0 and (term_months <= 0 or month <= term_months):
+                pv_cost += monthly_payment / discount_factor
+
+            if maintenance_monthly > 0 and not maintenance_included:
+                pv_cost += maintenance_monthly / discount_factor
+
+        if residual_value > 0 and residual_timing_months > 0 and residual_timing_months <= horizon_months:
+            discount_factor = (1 + periodic_discount_rate) ** residual_timing_months
+            if option_type in ["purchase", "buy", "compra", "credit", "credito"]:
+                pv_cost -= residual_value / discount_factor
+            elif option_type in ["leasing", "lease", "rental_purchase"]:
+                if lease_purchase_enabled:
+                    pv_cost += lease_purchase_price / discount_factor
+
+        if periodic_discount_rate == 0:
+            equivalent_monthly_cost = pv_cost / horizon_months if horizon_months > 0 else pv_cost
+        else:
+            annuity_factor = (periodic_discount_rate / (1 - (1 + periodic_discount_rate) ** (-horizon_months))) if horizon_months > 0 else 1.0
+            equivalent_monthly_cost = pv_cost * annuity_factor if annuity_factor else pv_cost
+
+        results.append(
+            {
+                "name": name,
+                "option_type": option_type,
+                "horizon_months": horizon_months,
+                "upfront_payment": _round2(upfront_payment),
+                "monthly_payment": _round2(monthly_payment),
+                "term_months": term_months,
+                "residual_value": _round2(residual_value),
+                "maintenance_monthly": _round2(maintenance_monthly),
+                "maintenance_included": maintenance_included,
+                "lease_purchase_enabled": lease_purchase_enabled,
+                "lease_purchase_price": _round2(lease_purchase_price),
+                "residual_timing_months": residual_timing_months,
+                "present_cost": _round2(pv_cost),
+                "equivalent_monthly_cost": _round2(equivalent_monthly_cost),
+            }
+        )
+
+    winner = None
+    if results:
+        winner = min(results, key=lambda x: x["present_cost"])
+
+    return {
+        "type": "compare_asset_options",
+        "inputs": {
+            "discount_rate": annual_discount_rate,
+            "rate_type": problem.get("rate_type", "effective_annual"),
+            "horizon_months": horizon_months,
+            "options": options,
+        },
+        "formula": "Compare present value of total ownership / leasing / rental cost over a common horizon",
+        "result": {
+            "comparison": results,
+            "best_by_present_cost": winner,
+        },
+    }
+
+
 def rate_conversion(problem: Dict) -> Dict:
     rate = _safe_float(problem.get("rate", 0.0))
     from_type = (problem.get("from_type", "effective_annual") or "effective_annual").lower()
@@ -440,6 +524,7 @@ def solve_problem(problem: Dict) -> Dict:
         "future_value": lambda p: future_value(p.get("present_value", 0), p.get("rate", 0), p.get("periods", 0)),
         "loan_payment": loan_payment,
         "compare_loans": compare_loans,
+        "compare_asset_options": compare_asset_options,
         "rate_conversion": rate_conversion,
         "refinance": refinance,
         "npv_irr": npv_irr,

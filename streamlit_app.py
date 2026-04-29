@@ -174,6 +174,13 @@ Base analysis context:
 
     meta_result = _extract_json_response(response)
 
+    # Validate meta_result against knowledge base output contract (basic checks)
+    kb_contract = knowledge_base.get('output_contract', {})
+    try:
+        _validate_meta_output(meta_result, kb_contract)
+    except Exception as e:
+        raise ValueError(f"Meta analysis result validation failed: {e}")
+
     calls_used = llm.call_count - calls_before
     cost_used = llm.total_cost - cost_before
 
@@ -188,6 +195,104 @@ Base analysis context:
         'timestamp': datetime.now().isoformat(),
         'source_signature': result['analysis']['report_generated_at']
     }
+
+
+def _is_number_like(v):
+    try:
+        if isinstance(v, (int, float)):
+            return True
+        float(v)
+        return True
+    except Exception:
+        return False
+
+
+def _validate_solved_result(solved: dict):
+    """Basic validation that the deterministic solver returned numeric results.
+
+    Raises ValueError if critical numeric fields are missing or non-numeric.
+    """
+    result = solved.get('result') or {}
+    if not result:
+        raise ValueError('Solver returned empty result')
+
+    # Check common expected numeric fields for different problem types
+    # We only enforce that all leaf scalar values are number-like
+    optional_null_paths = {
+        'trace.result.best_by_total_paid',
+        'result.best_by_total_paid',
+    }
+
+    def walk(obj, path=''):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                walk(v, f"{path}.{k}" if path else k)
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                walk(item, f"{path}[{i}]")
+        else:
+            if obj is None:
+                if path in optional_null_paths:
+                    return
+                raise ValueError(f'Non-numeric result at {path}: None')
+            if isinstance(obj, str) and obj.strip() == '':
+                raise ValueError(f'Empty string in numeric result at {path}')
+            # allow booleans? treat as invalid for numeric outputs
+            if isinstance(obj, bool):
+                raise ValueError(f'Unexpected boolean in numeric result at {path}')
+            # If scalar, ensure convertible to float when expected
+            try:
+                float(obj)
+            except Exception:
+                # allow non-numeric lists/dicts (they should have been deeper-walked)
+                raise ValueError(f'Non-numeric scalar in result at {path}: {obj}')
+
+    # Walk trace result and top-level result
+    trace_res = solved.get('trace', {}).get('result', {})
+    if trace_res:
+        walk(trace_res, 'trace.result')
+    else:
+        # Fallback to checking top-level result
+        walk(result, 'result')
+
+
+def _validate_meta_output(meta_result: dict, contract: dict):
+    """Basic validator for meta-analysis output against the knowledge base contract.
+
+    This does superficial checks: presence of top-level keys and numeric types for key fields.
+    Raises ValueError on mismatch.
+    """
+    if not isinstance(meta_result, dict):
+        raise ValueError('Meta result is not a JSON object')
+
+    required = contract.get('required_structure', {})
+    # Check status
+    status_values = required.get('status_values', [])
+    status = meta_result.get('status')
+    if status_values and status not in status_values:
+        raise ValueError(f"Invalid or missing status: {status}")
+
+    summary = meta_result.get('summary')
+    if not isinstance(summary, dict):
+        raise ValueError('Missing summary object')
+    for key in ['income', 'expenses', 'savings_rate']:
+        if key not in summary:
+            raise ValueError(f"Summary missing '{key}'")
+        if not _is_number_like(summary.get(key)):
+            raise ValueError(f"Summary field '{key}' is not numeric")
+
+    # category_analysis basic check
+    cats = meta_result.get('category_analysis', [])
+    if not isinstance(cats, list):
+        raise ValueError('category_analysis must be a list')
+    for i, c in enumerate(cats[:6]):
+        if not isinstance(c, dict):
+            raise ValueError(f'category_analysis[{i}] is not an object')
+        if 'category' not in c or 'spent' not in c:
+            raise ValueError(f'category_analysis[{i}] missing category or spent')
+        if not _is_number_like(c.get('spent')):
+            raise ValueError(f'category_analysis[{i}].spent is not numeric')
+
 
 
 def _clear_meta_analysis_state():
@@ -217,6 +322,8 @@ def _infer_problem_type(payload: dict) -> str:
         return "refinance"
     if payload.get("loans"):
         return "compare_loans"
+    if payload.get("options"):
+        return "compare_asset_options"
     if payload.get("structures"):
         return "debt_structures"
     if payload.get("cashflows"):
@@ -337,6 +444,30 @@ def _apply_financial_defaults(payload: dict) -> dict:
             ensure_common_loan_fields(loan)
         normalized["inputs"]["loans"] = loans
 
+    elif ptype == "compare_asset_options":
+        options = normalized["inputs"].get("options") or normalized.get("options") or []
+        for option in options:
+            option.setdefault("option_type", "purchase")
+            if option.get("monthly_payment") in [None, ""]:
+                option["monthly_payment"] = 0.0
+            if option.get("upfront_payment") in [None, ""] and option.get("purchase_price") is not None:
+                option["upfront_payment"] = option.get("purchase_price")
+            if option.get("term_months") in [None, "", 0, "0"]:
+                option["term_months"] = normalized.get("horizon_months", normalized.get("periods", 48)) or 48
+            if option.get("maintenance_monthly") in [None, ""]:
+                option["maintenance_monthly"] = 0.0
+            if option.get("maintenance_included") in [None, ""]:
+                option["maintenance_included"] = False
+            if option.get("residual_value") in [None, ""]:
+                option["residual_value"] = 0.0
+        normalized["inputs"]["options"] = options
+        if normalized["inputs"].get("discount_rate") in [None, "", 0, "0"]:
+            normalized["inputs"]["discount_rate"] = 0.10
+            add_default("Tasa de descuento asumida: 10% anual")
+        if normalized["inputs"].get("horizon_months") in [None, "", 0, "0"]:
+            normalized["inputs"]["horizon_months"] = 48
+            add_default("Horizonte de comparación asumido: 48 meses")
+
     elif ptype == "refinance":
         current_loan = normalized["inputs"].get("current_loan") or normalized.get("current_loan") or {}
         proposed_loan = normalized["inputs"].get("proposed_loan") or normalized.get("proposed_loan") or {}
@@ -386,6 +517,7 @@ Supported problem_type values:
 - future_value
 - loan_payment
 - compare_loans
+- compare_asset_options
 - rate_conversion
 - refinance
 - npv_irr
@@ -399,6 +531,8 @@ Rules:
 - You MUST document these injected assumptions specifically in the "defaults_used" array (e.g. "Tasa de tarjeta de crédito asumida: 35% anual").
 - If ambiguity exists, explain it in ambiguity_disclosure.
 - Use periodicity monthly and day_basis 365 unless user states otherwise.
+- Prefer fields that can directly populate structured form boxes. For loan comparisons, return each loan as an object with name, principal, rate, rate_type, periods, and method.
+- Do not omit fields that are already inferable from the question; if you must assume a default, keep it numeric and record it in defaults_used.
 
 Required output shape:
 {
@@ -455,6 +589,28 @@ def _generate_problem_narrative(question: str, solved: dict) -> dict:
     calls_before = llm.call_count
     cost_before = llm.total_cost
 
+    solver_type = (solved.get("type") or solved.get("result", {}).get("type") or "").lower()
+    solved_result = solved.get("result", {}) or {}
+
+    deterministic_summary = ""
+    if solver_type == "compare_loans":
+        comparisons = solved_result.get("comparison") or []
+        winner = solved_result.get("best_by_total_paid") or {}
+        if comparisons and isinstance(winner, dict):
+            name = winner.get("name") or "la mejor opción"
+            method = winner.get("method") or "desconocido"
+            total_paid = winner.get("total_paid")
+            total_interest = winner.get("total_interest")
+            deterministic_summary = (
+                f"Resultado principal: la opción con menor costo total es {name} "
+                f"(método {method}), con pago total de {total_paid} y intereses totales de {total_interest}."
+            )
+        else:
+            deterministic_summary = (
+                "Resultado principal: el solver no recibió alternativas suficientes para comparar "
+                "costos totales e intereses pagados."
+            )
+
     system_prompt = """You are a financial analyst.
 Write a concise but human-readable report in Spanish with this structure:
 1) Interpretación del problema
@@ -464,10 +620,13 @@ Write a concise but human-readable report in Spanish with this structure:
 5) Interpretación ejecutiva
 6) Recomendaciones accionables
 
-Rules:
+Strict rules:
 - Mention that this is educational and not regulated investment advice.
 - Do not recommend specific financial products without user profile context.
-- Always reference the deterministic results provided in the input.
+- Always reference ONLY the deterministic results provided in the input (the solver's trace).
+- Do NOT invent or introduce any new numeric values. Use only numbers present in the solver output (`trace.result` or top-level `result`).
+- If a deterministic main result is provided in the user prompt, include it verbatim in the section '4) Resultado principal'.
+- If you cannot produce the narrative without adding or guessing numbers, return an error instead of fabricating values.
 """
 
     user_prompt = f"""Original question:
@@ -475,11 +634,17 @@ Rules:
 
 Deterministic solution trace:
 {json.dumps(solved, ensure_ascii=False, indent=2)}
+
+Deterministic main result to include verbatim if available:
+{deterministic_summary}
 """
 
     narrative = llm.make_call(user_prompt, system_prompt, expect_json=False)
     if not narrative:
         raise ValueError("No se pudo generar redacción ejecutiva.")
+
+    if deterministic_summary and deterministic_summary not in narrative:
+        narrative = f"{deterministic_summary}\n\n{narrative}"
 
     calls_used = llm.call_count - calls_before
     cost_used = llm.total_cost - cost_before
@@ -492,14 +657,722 @@ Deterministic solution trace:
     }
 
 
+def _build_structured_problem_payload(problem_type: str, currency: str, values: dict) -> dict:
+    """Build a deterministic, human-editable payload for direct calculation.
+
+    The structured flow avoids free-form interpretation for common financial math
+    patterns and produces a payload that can be reviewed before solving.
+    """
+    payload = {
+        "problem_type": problem_type,
+        "currency": currency,
+        "day_basis": 365,
+        "periodicity": "monthly",
+        "inputs": {},
+        "assumptions": [],
+        "defaults_used": [],
+        "ambiguity_disclosure": "",
+    }
+
+    if problem_type == "loan_payment":
+        payload["inputs"] = {
+            "principal": values.get("principal", 0),
+            "rate": values.get("rate", 0),
+            "rate_type": values.get("rate_type", "effective_annual"),
+            "periods": values.get("periods", 0),
+            "method": values.get("method", "french"),
+        }
+    elif problem_type == "compare_loans":
+        payload["inputs"] = {
+            "loans": values.get("loans", []),
+        }
+    elif problem_type == "compare_asset_options":
+        payload["inputs"] = {
+            "discount_rate": values.get("discount_rate", 0),
+            "rate_type": values.get("rate_type", "effective_annual"),
+            "horizon_months": values.get("horizon_months", 48),
+            "options": values.get("options", []),
+        }
+    elif problem_type == "present_value":
+        payload["inputs"] = {
+            "future_value": values.get("future_value", 0),
+            "rate": values.get("rate", 0),
+            "periods": values.get("periods", 0),
+        }
+    elif problem_type == "future_value":
+        payload["inputs"] = {
+            "present_value": values.get("present_value", 0),
+            "rate": values.get("rate", 0),
+            "periods": values.get("periods", 0),
+        }
+    elif problem_type == "rate_conversion":
+        payload["inputs"] = {
+            "rate": values.get("rate", 0),
+            "from_type": values.get("from_type", "effective_annual"),
+        }
+    elif problem_type == "npv_irr":
+        payload["inputs"] = {
+            "cashflows": values.get("cashflows", []),
+            "discount_rate": values.get("discount_rate", 0),
+        }
+    elif problem_type == "real_return":
+        payload["inputs"] = {
+            "nominal_return": values.get("nominal_return", 0),
+            "inflation": values.get("inflation", 0),
+        }
+    else:
+        payload["inputs"] = values
+
+    return payload
+
+
+def _is_valid_structured_payload(payload: dict) -> tuple[bool, str]:
+    """Validate the structured payload before allowing resolution."""
+    ptype = (payload.get("problem_type") or "").lower().strip()
+    inputs = payload.get("inputs", {}) or {}
+
+    def has_positive_number(value):
+        try:
+            return float(value) > 0
+        except Exception:
+            return False
+
+    if ptype == "loan_payment":
+        if not has_positive_number(inputs.get("principal")):
+            return False, "Ingresa un principal mayor que cero."
+        if not has_positive_number(inputs.get("rate")):
+            return False, "Ingresa una tasa mayor que cero."
+        if not has_positive_number(inputs.get("periods")):
+            return False, "Ingresa un plazo mayor que cero."
+        return True, ""
+
+    if ptype == "compare_loans":
+        loans = inputs.get("loans") or []
+        if len(loans) < 2:
+            return False, "Necesitas al menos dos préstamos para comparar."
+        for index, loan in enumerate(loans, start=1):
+            if not has_positive_number(loan.get("principal")):
+                return False, f"El préstamo {index} necesita un principal mayor que cero."
+            if not has_positive_number(loan.get("rate")):
+                return False, f"El préstamo {index} necesita una tasa mayor que cero."
+            if not has_positive_number(loan.get("periods")):
+                return False, f"El préstamo {index} necesita un plazo mayor que cero."
+        return True, ""
+
+    if ptype == "compare_asset_options":
+        options = inputs.get("options") or []
+        if len(options) < 2:
+            return False, "Necesitas al menos dos opciones para comparar."
+        if not has_positive_number(inputs.get("horizon_months")):
+            return False, "Ingresa un horizonte de comparación mayor que cero."
+        for index, option in enumerate(options, start=1):
+            if not option.get("name"):
+                return False, f"La opción {index} necesita un nombre."
+            if option.get("monthly_payment") is None and option.get("upfront_payment") is None:
+                return False, f"La opción {index} necesita al menos un pago inicial o mensual."
+        return True, ""
+
+    if ptype == "present_value":
+        if not has_positive_number(inputs.get("future_value")):
+            return False, "Ingresa un valor futuro mayor que cero."
+        if not has_positive_number(inputs.get("rate")):
+            return False, "Ingresa una tasa mayor que cero."
+        if not has_positive_number(inputs.get("periods")):
+            return False, "Ingresa un número de periodos mayor que cero."
+        return True, ""
+
+    if ptype == "future_value":
+        if not has_positive_number(inputs.get("present_value")):
+            return False, "Ingresa un valor presente mayor que cero."
+        if not has_positive_number(inputs.get("rate")):
+            return False, "Ingresa una tasa mayor que cero."
+        if not has_positive_number(inputs.get("periods")):
+            return False, "Ingresa un número de periodos mayor que cero."
+        return True, ""
+
+    if ptype == "rate_conversion":
+        if not has_positive_number(inputs.get("rate")):
+            return False, "Ingresa una tasa mayor que cero."
+        return True, ""
+
+    if ptype == "npv_irr":
+        cashflows = inputs.get("cashflows") or []
+        if len(cashflows) < 2:
+            return False, "Ingresa al menos dos flujos de caja."
+        return True, ""
+
+    if ptype == "real_return":
+        if not has_positive_number(inputs.get("nominal_return")):
+            return False, "Ingresa una rentabilidad nominal mayor que cero."
+        return True, ""
+
+    return False, "Tipo de problema no soportado por el formulario estructurado."
+
+
+def _calculate_quick_loan_comparison(loans: list) -> dict:
+    """Calculate comparison metrics for loans without full solver overhead."""
+    from utils.financial_solver import loan_payment
+    
+    results = []
+    for loan in loans:
+        # Allow 0% interest rate, but require principal and periods
+        principal = loan.get("principal")
+        rate = loan.get("rate")
+        periods = loan.get("periods")
+        if not (principal and periods and rate is not None):
+            continue
+        try:
+            calc = loan_payment(loan)
+            results.append({
+                "name": loan.get("name", "Préstamo"),
+                "principal": float(loan.get("principal", 0)),
+                "rate": float(loan.get("rate", 0)),
+                "periods": int(loan.get("periods", 0)),
+                "estimated_payment": calc.get("result", {}).get("estimated_payment", 0),
+                "total_paid": calc.get("result", {}).get("total_paid", 0),
+                "total_interest": calc.get("result", {}).get("total_interest", 0),
+            })
+        except Exception:
+            pass
+    
+    if results:
+        results_sorted = sorted(results, key=lambda x: x.get("total_paid", 0))
+        for i, r in enumerate(results_sorted, 1):
+            r["rank"] = i
+        return {"results": results_sorted}
+
+    return {"results": []}
+
+
+def _calculate_quick_asset_comparison(problem: dict) -> dict:
+    """Calculate present-cost comparison for acquisition, lease, and rental options."""
+    from utils.financial_solver import compare_asset_options
+
+    try:
+        solved = compare_asset_options(problem)
+    except Exception:
+        return {"results": []}
+
+    results = solved.get("result", {}).get("comparison", []) or []
+    results_sorted = sorted(results, key=lambda x: x.get("present_cost", 0))
+    for rank, row in enumerate(results_sorted, start=1):
+        row["rank"] = rank
+
+    return {"results": results_sorted}
+
+
+def _prime_structured_form_state(draft: dict):
+    """Populate widget state from a parsed natural-language draft."""
+    if not isinstance(draft, dict):
+        return
+
+    ptype = (draft.get("problem_type") or "").lower().strip()
+    inputs = draft.get("inputs", {}) or {}
+
+    st.session_state["structured_problem_type"] = ptype or "loan_payment"
+
+    if ptype == "loan_payment":
+        st.session_state["lp_principal"] = inputs.get("principal", st.session_state.get("lp_principal", 0.0))
+        st.session_state["lp_rate"] = inputs.get("rate", st.session_state.get("lp_rate", 0.0))
+        st.session_state["lp_periods"] = inputs.get("periods", st.session_state.get("lp_periods", 0))
+        st.session_state["lp_rate_type"] = inputs.get("rate_type", st.session_state.get("lp_rate_type", "effective_annual"))
+        st.session_state["lp_method"] = inputs.get("method", st.session_state.get("lp_method", "french"))
+
+    elif ptype == "compare_loans":
+        loans = inputs.get("loans", []) or []
+        st.session_state["cl_loan_count"] = max(len(loans) + 1, 2)
+        for index, loan in enumerate(loans, start=1):
+            st.session_state[f"cl_name_{index}"] = loan.get("name", st.session_state.get(f"cl_name_{index}", f"Opción {index}"))
+            st.session_state[f"cl_principal_{index}"] = loan.get("principal", st.session_state.get(f"cl_principal_{index}", 0.0))
+            st.session_state[f"cl_rate_{index}"] = loan.get("rate", st.session_state.get(f"cl_rate_{index}", 0.0))
+            st.session_state[f"cl_periods_{index}"] = loan.get("periods", st.session_state.get(f"cl_periods_{index}", 0))
+            st.session_state[f"cl_rate_type_{index}"] = loan.get("rate_type", st.session_state.get(f"cl_rate_type_{index}", "effective_annual"))
+            st.session_state[f"cl_method_{index}"] = loan.get("method", st.session_state.get(f"cl_method_{index}", "french"))
+
+    elif ptype == "compare_asset_options":
+        options = inputs.get("options", []) or []
+        st.session_state["cao_option_count"] = max(len(options) + 1, 3)
+        st.session_state["cao_horizon_months"] = inputs.get("horizon_months", st.session_state.get("cao_horizon_months", 48))
+        st.session_state["cao_discount_rate"] = inputs.get("discount_rate", st.session_state.get("cao_discount_rate", 0.10))
+        st.session_state["cao_rate_type"] = inputs.get("rate_type", st.session_state.get("cao_rate_type", "effective_annual"))
+        for index, option in enumerate(options, start=1):
+            st.session_state[f"cao_name_{index}"] = option.get("name", st.session_state.get(f"cao_name_{index}", f"Opción {index}"))
+            st.session_state[f"cao_type_{index}"] = option.get("option_type", st.session_state.get(f"cao_type_{index}", "purchase"))
+            st.session_state[f"cao_upfront_{index}"] = option.get("upfront_payment", st.session_state.get(f"cao_upfront_{index}", 0.0))
+            st.session_state[f"cao_monthly_{index}"] = option.get("monthly_payment", st.session_state.get(f"cao_monthly_{index}", 0.0))
+            st.session_state[f"cao_term_{index}"] = option.get("term_months", st.session_state.get(f"cao_term_{index}", 48))
+            st.session_state[f"cao_residual_{index}"] = option.get("residual_value", st.session_state.get(f"cao_residual_{index}", 0.0))
+            st.session_state[f"cao_lease_buy_{index}"] = option.get("lease_purchase_enabled", st.session_state.get(f"cao_lease_buy_{index}", False))
+            st.session_state[f"cao_lease_buy_price_{index}"] = option.get("lease_purchase_price", st.session_state.get(f"cao_lease_buy_price_{index}", 0.0))
+            st.session_state[f"cao_maint_{index}"] = option.get("maintenance_monthly", st.session_state.get(f"cao_maint_{index}", 0.0))
+            st.session_state[f"cao_maint_included_{index}"] = option.get("maintenance_included", st.session_state.get(f"cao_maint_included_{index}", False))
+            st.session_state[f"cao_residual_timing_{index}"] = option.get("residual_timing_months", st.session_state.get(f"cao_residual_timing_{index}", 48))
+
+    elif ptype == "present_value":
+        st.session_state["pv_future"] = inputs.get("future_value", st.session_state.get("pv_future", 0.0))
+        st.session_state["pv_rate"] = inputs.get("rate", st.session_state.get("pv_rate", 0.0))
+        st.session_state["pv_periods"] = inputs.get("periods", st.session_state.get("pv_periods", 0))
+
+    elif ptype == "future_value":
+        st.session_state["fv_present"] = inputs.get("present_value", st.session_state.get("fv_present", 0.0))
+        st.session_state["fv_rate"] = inputs.get("rate", st.session_state.get("fv_rate", 0.0))
+        st.session_state["fv_periods"] = inputs.get("periods", st.session_state.get("fv_periods", 0))
+
+    elif ptype == "rate_conversion":
+        st.session_state["rc_rate"] = inputs.get("rate", st.session_state.get("rc_rate", 0.0))
+        st.session_state["rc_from_type"] = inputs.get("from_type", st.session_state.get("rc_from_type", "effective_annual"))
+
+    elif ptype == "npv_irr":
+        cashflows = inputs.get("cashflows", []) or []
+        st.session_state["npv_cashflows"] = ", ".join(str(x) for x in cashflows)
+        st.session_state["npv_discount_rate"] = inputs.get("discount_rate", st.session_state.get("npv_discount_rate", 0.0))
+
+    elif ptype == "real_return":
+        st.session_state["rr_nominal"] = inputs.get("nominal_return", st.session_state.get("rr_nominal", 0.0))
+        st.session_state["rr_inflation"] = inputs.get("inflation", st.session_state.get("rr_inflation", 0.0))
+
+
+def _render_structured_problem_builder(currency: str):
+    """Render a structured calculator builder and return a payload if submitted."""
+    st.subheader("🧩 Caja de cálculo estructurada")
+    st.caption("Escribe el problema en lenguaje natural; el LLM llenará las cajas y luego tú solo revisas antes de autorizar.")
+    
+    # Add custom CSS for orange button
+    st.markdown("""
+        <style>
+            [data-testid="column"] button[kind="primary"] {
+                background-color: #FF9800 !important;
+                color: white !important;
+                padding: 12px 24px !important;
+                font-size: 16px !important;
+                font-weight: 600 !important;
+                border-radius: 8px !important;
+                height: 48px !important;
+            }
+            [data-testid="column"] button[kind="primary"]:hover {
+                background-color: #F57C00 !important;
+            }
+        </style>
+    """, unsafe_allow_html=True)
+
+    structured_question = st.text_area(
+        "Describe el problema en lenguaje natural",
+        value=st.session_state.get("structured_natural_question", ""),
+        height=200,
+        placeholder="Ej: Tengo dos créditos, uno al 32% y otro al 24%, ambos a 24 meses. Quiero saber cuál me conviene más.",
+        key="structured_natural_question",
+    )
+
+    # Large orange button for interpretation
+    interpret_clicked = st.button(
+        "🤖 Interpretar y llenar cajas",
+        type="primary",
+        use_container_width=True,
+        help="El LLM interpretará tu problema y rellenará automáticamente las cajas de cálculo"
+    )
+    
+    if interpret_clicked:
+        if not structured_question.strip():
+            st.warning("Escribe un problema en lenguaje natural antes de interpretar.")
+        else:
+            try:
+                with st.spinner("Traduciendo el problema a campos estructurados..."):
+                    parsed = _interpret_problem_to_json(structured_question.strip(), currency)
+                    draft = parsed["draft"]
+                    _prime_structured_form_state(draft)
+                    st.session_state.problem_source_question = structured_question.strip()
+                    st.session_state.problem_draft = draft
+                    st.session_state.problem_draft_text = json.dumps(draft, ensure_ascii=False, indent=2)
+                    st.session_state.problem_solver_metrics = {
+                        "parse_llm_calls": parsed["metrics"]["llm_calls"],
+                        "parse_cost": parsed["metrics"]["estimated_cost"],
+                        "narrative_llm_calls": 0,
+                        "narrative_cost": 0.0,
+                    }
+                    st.session_state.problem_solver_error = None
+                    st.success("Cajas llenas. Revisa los datos y autoriza el cálculo.")
+            except Exception as e:
+                st.session_state.problem_solver_error = str(e)
+
+    problem_type = st.selectbox(
+        "Tipo de cálculo",
+        ["loan_payment", "compare_loans", "compare_asset_options", "present_value", "future_value", "rate_conversion", "npv_irr", "real_return"],
+        index=0,
+        format_func=lambda x: {
+            "loan_payment": "Pago de préstamo",
+            "compare_loans": "Comparar préstamos",
+            "compare_asset_options": "Comparar compra / leasing / renta",
+            "present_value": "Valor presente",
+            "future_value": "Valor futuro",
+            "rate_conversion": "Conversión de tasa",
+            "npv_irr": "VAN / TIR",
+            "real_return": "Rentabilidad real",
+        }.get(x, x),
+        key="structured_problem_type",
+    )
+
+    # Special handling for compare_loans (outside form due to buttons)
+    if problem_type == "compare_loans":
+        st.markdown("Define los préstamos que deseas comparar. Siempre habrá una caja vacía para agregar más.")
+        
+        # Initialize loan count if needed
+        if "cl_loan_count" not in st.session_state:
+            st.session_state["cl_loan_count"] = 2
+        
+        # Add more loans button (outside form)
+        col_add, col_calc = st.columns([1, 2])
+        with col_add:
+            if st.button("➕ Agregar otra opción", use_container_width=True, key="cl_add_btn"):
+                st.session_state["cl_loan_count"] += 1
+                st.rerun()
+        
+        # Build loans data from session state
+        loans = []
+        num_loans = st.session_state.get("cl_loan_count", 2)
+        
+        for idx in range(1, num_loans + 1):
+            with st.expander(f"Préstamo {idx}", expanded=(idx <= 2)):
+                loan_col1, loan_col2, loan_col3 = st.columns(3)
+                with loan_col1:
+                    name = st.text_input(f"Nombre {idx}", value=st.session_state.get(f"cl_name_{idx}", f"Opción {idx}"), key=f"cl_name_{idx}")
+                    principal = st.number_input(f"Principal {idx}", min_value=0.0, value=float(st.session_state.get(f"cl_principal_{idx}", 0.0)), step=1000.0, key=f"cl_principal_{idx}")
+                with loan_col2:
+                    rate = st.number_input(f"Tasa anual {idx}", min_value=0.0, value=float(st.session_state.get(f"cl_rate_{idx}", 0.0)), step=0.01, format="%.4f", key=f"cl_rate_{idx}")
+                    periods = st.number_input(f"Plazo {idx}", min_value=0, value=int(st.session_state.get(f"cl_periods_{idx}", 0)), step=1, key=f"cl_periods_{idx}")
+                with loan_col3:
+                    rate_type = st.selectbox(f"Tipo de tasa {idx}", ["effective_annual", "nominal_annual", "effective_monthly"], index=0, key=f"cl_rate_type_{idx}")
+                    method = st.selectbox(f"Método {idx}", ["french", "german", "american"], index=0, key=f"cl_method_{idx}")
+                
+                loans.append({
+                    "name": name,
+                    "principal": principal,
+                    "rate": rate,
+                    "rate_type": rate_type,
+                    "periods": periods,
+                    "method": method,
+                })
+        
+        # Quick comparison button and results
+        st.divider()
+        if st.button("📊 Calcular comparación rápida", type="secondary", use_container_width=True, key="cl_calc_btn"):
+            # Allow 0% rate; just check principal and periods
+            valid_loans = [l for l in loans if l["principal"] > 0 and l["periods"] > 0 and l["rate"] is not None]
+            if len(valid_loans) >= 2:
+                comparison_result = _calculate_quick_loan_comparison(loans)
+                if comparison_result.get("results"):
+                    st.subheader("📊 Resultados de comparación")
+                    
+                    # Table view
+                    df_comparison = pd.DataFrame([
+                        {
+                            "🏆": "🥇" if r["rank"] == 1 else "🥈" if r["rank"] == 2 else "🥉",
+                            "Opción": r["name"],
+                            "Principal": f"${r['principal']:,.2f}",
+                            "Tasa": f"{r['rate']*100:.2f}%",
+                            "Plazo": f"{r['periods']} meses",
+                            "Cuota": f"${r['estimated_payment']:,.2f}",
+                            "Total Pagado": f"${r['total_paid']:,.2f}",
+                            "Intereses": f"${r['total_interest']:,.2f}",
+                        }
+                        for r in comparison_result["results"]
+                    ])
+                    st.dataframe(df_comparison, use_container_width=True, hide_index=True)
+                    
+                    # Winner info
+                    winner = comparison_result["results"][0] if comparison_result["results"] else None
+                    if winner:
+                        st.success(f"✅ **Mejor opción:** {winner['name']} con pago total de ${winner['total_paid']:,.2f}")
+            else:
+                st.warning("Necesitas al menos 2 préstamos completamente llenos (principal, plazo > 0; tasa >= 0).")
+        st.divider()
+        
+        # For compare_loans, just show results - no need for JSON editor or solver
+        return None
+
+    if problem_type == "compare_asset_options":
+        st.markdown("Compara compra, leasing y renta operativa en un mismo horizonte de caja.")
+
+        if "cao_option_count" not in st.session_state:
+            st.session_state["cao_option_count"] = 3
+
+        col_add, col_calc = st.columns([1, 2])
+        with col_add:
+            if st.button("➕ Agregar otra opción", use_container_width=True, key="cao_add_btn"):
+                st.session_state["cao_option_count"] += 1
+                st.rerun()
+
+        with col_calc:
+            calculate_quick = st.button("🧮 Calcular comparación", type="primary", use_container_width=True, key="cao_calc_btn")
+
+        horizon_months = st.number_input("Horizonte de comparación (meses)", min_value=1, value=48, step=1, key="cao_horizon_months")
+        discount_rate = st.number_input("Tasa de descuento anual", min_value=0.0, value=0.10, step=0.01, format="%.4f", key="cao_discount_rate")
+        rate_type = st.selectbox("Tipo de tasa", ["effective_annual", "nominal_annual", "effective_monthly"], index=0, key="cao_rate_type")
+
+        options = []
+        option_count = st.session_state.get("cao_option_count", 3)
+        default_templates = ["Compra directa", "Leasing", "Renta operativa"]
+        default_types = ["purchase", "leasing", "rent"]
+
+        for idx in range(1, option_count + 1):
+            with st.expander(f"Opción {idx}", expanded=(idx <= 3)):
+                option_col1, option_col2, option_col3 = st.columns(3)
+                with option_col1:
+                    option_name = st.text_input(
+                        f"Nombre {idx}",
+                        value=st.session_state.get(f"cao_name_{idx}", default_templates[idx - 1] if idx <= 3 else f"Opción {idx}"),
+                        key=f"cao_name_{idx}",
+                    )
+                    tipo_options = ["purchase", "leasing", "rent", "credit"]
+                    # Determinar tipo por defecto según el índice
+                    if idx == 1:
+                        tipo_default = "purchase"
+                    elif idx == 2:
+                        tipo_default = "leasing"
+                    elif idx == 3:
+                        tipo_default = "rent"
+                    else:
+                        tipo_default = "purchase"
+                    
+                    # Usar valor guardado en session state o default
+                    tipo_saved = st.session_state.get(f"cao_type_{idx}")
+                    tipo_value = tipo_saved if tipo_saved else tipo_default
+                    tipo_index = tipo_options.index(tipo_value) if tipo_value in tipo_options else 0
+                    
+                    option_type = st.selectbox(
+                        f"Tipo {idx}",
+                        tipo_options,
+                        index=tipo_index,
+                        key=f"cao_type_{idx}",
+                    )
+                    upfront_payment = st.number_input(
+                        f"Pago inicial {idx}",
+                        min_value=0.0,
+                        value=float(st.session_state.get(f"cao_upfront_{idx}", 0.0)),
+                        step=1000.0,
+                        key=f"cao_upfront_{idx}",
+                    )
+                    residual_value = st.number_input(
+                        f"Valor residual / reventa {idx}",
+                        min_value=0.0,
+                        value=float(st.session_state.get(f"cao_residual_{idx}", 0.0)),
+                        step=1000.0,
+                        key=f"cao_residual_{idx}",
+                    )
+                with option_col2:
+                    monthly_payment = st.number_input(
+                        f"Pago mensual {idx}",
+                        min_value=0.0,
+                        value=float(st.session_state.get(f"cao_monthly_{idx}", 0.0)),
+                        step=1000.0,
+                        key=f"cao_monthly_{idx}",
+                    )
+                    term_months = st.number_input(
+                        f"Plazo / duración {idx}",
+                        min_value=0,
+                        value=int(st.session_state.get(f"cao_term_{idx}", int(horizon_months))),
+                        step=1,
+                        key=f"cao_term_{idx}",
+                    )
+                    # Mostrar opciones de compra final solo para leasing
+                    if option_type == "leasing":
+                        lease_purchase_enabled = st.checkbox(
+                            f"El leasing incluye compra final {idx}",
+                            value=bool(st.session_state.get(f"cao_lease_buy_{idx}", False)),
+                            key=f"cao_lease_buy_{idx}",
+                        )
+                        if lease_purchase_enabled:
+                            lease_purchase_price = st.number_input(
+                                f"Precio de compra final leasing {idx}",
+                                min_value=0.0,
+                                value=float(st.session_state.get(f"cao_lease_buy_price_{idx}", 0.0)),
+                                step=1000.0,
+                                key=f"cao_lease_buy_price_{idx}",
+                            )
+                        else:
+                            lease_purchase_price = 0.0
+                    else:
+                        lease_purchase_enabled = False
+                        lease_purchase_price = 0.0
+                with option_col3:
+                    # Mostrar mantenimiento solo para purchase, leasing
+                    if option_type in ["purchase", "leasing"]:
+                        maintenance_monthly = st.number_input(
+                            f"Mantenimiento mensual {idx}",
+                            min_value=0.0,
+                            value=float(st.session_state.get(f"cao_maint_{idx}", 0.0)),
+                            step=1000.0,
+                            key=f"cao_maint_{idx}",
+                        )
+                        maintenance_included = st.checkbox(
+                            f"Mantenimiento incluido {idx}",
+                            value=bool(st.session_state.get(f"cao_maint_included_{idx}", False)),
+                            key=f"cao_maint_included_{idx}",
+                        )
+                    else:
+                        maintenance_monthly = 0.0
+                        maintenance_included = False
+                    
+                    # Mostrar timing del residual solo para purchase y leasing
+                    if option_type in ["purchase", "leasing"]:
+                        residual_timing_months = st.number_input(
+                            f"Cuándo se toma el residual {idx}",
+                            min_value=0,
+                            value=int(st.session_state.get(f"cao_residual_timing_{idx}", int(horizon_months))),
+                            step=1,
+                            key=f"cao_residual_timing_{idx}",
+                        )
+                    else:
+                        residual_timing_months = int(horizon_months)
+                    
+                    if option_type == "rent":
+                        st.caption("Para arriendo, el residual final normalmente es 0.")
+                    elif option_type == "purchase":
+                        st.caption("Para compra, el residual se resta como valor de reventa esperado.")
+                    elif option_type == "leasing":
+                        st.caption("Para leasing, puedes activar la compra final si aplica.")
+                    elif option_type == "credit":
+                        st.caption("Para crédito, la tasa se aplica al principal y se calcula interés.")
+
+                options.append({
+                    "name": option_name,
+                    "option_type": option_type,
+                    "upfront_payment": upfront_payment,
+                    "monthly_payment": monthly_payment,
+                    "term_months": term_months,
+                    "residual_value": residual_value,
+                    "lease_purchase_enabled": lease_purchase_enabled,
+                    "lease_purchase_price": lease_purchase_price,
+                    "maintenance_monthly": maintenance_monthly,
+                    "maintenance_included": maintenance_included,
+                    "residual_timing_months": residual_timing_months,
+                })
+
+        st.divider()
+        if calculate_quick:
+            valid_options = [o for o in options if o["name"] and int(o["term_months"]) >= 0]
+            if len(valid_options) >= 2:
+                comparison_result = _calculate_quick_asset_comparison({
+                    "discount_rate": discount_rate,
+                    "rate_type": rate_type,
+                    "horizon_months": int(horizon_months),
+                    "options": options,
+                })
+                if comparison_result.get("results"):
+                    # Filtrar opciones con costo presente > 0
+                    valid_results = [r for r in comparison_result["results"] if r.get("present_cost", 0) > 0]
+                    if valid_results:
+                        st.subheader("📊 Resultados de comparación")
+                        df_comparison = pd.DataFrame([
+                            {
+                                "🏆": "🥇" if r["rank"] == 1 else "🥈" if r["rank"] == 2 else "🥉",
+                                "Opción": r["name"],
+                                "Tipo": r["option_type"],
+                                "Residual / compra final": f"${r['residual_value']:,.2f}" if r.get("residual_value") else "$0.00",
+                                "Costo presente": f"${r['present_cost']:,.2f}",
+                                "Costo mensual equivalente": f"${r['equivalent_monthly_cost']:,.2f}",
+                            }
+                            for r in valid_results
+                        ])
+                        st.dataframe(df_comparison, use_container_width=True, hide_index=True)
+                        winner = valid_results[0] if valid_results else None
+                        if winner:
+                            st.success(f"✅ **Mejor opción:** {winner['name']} con costo presente de ${winner['present_cost']:,.2f}")
+                    else:
+                        st.warning("Todas las opciones tienen costo $0. Verifica los datos ingresados.")
+            else:
+                st.warning("Necesitas al menos 2 opciones completas para comparar.")
+        st.divider()
+        return None
+
+    # For all other types, use the form
+    payload = None
+    with st.form("structured_problem_form", clear_on_submit=False):
+        values = {}
+
+        if problem_type == "loan_payment":
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                values["principal"] = st.number_input("Principal", min_value=0.0, value=0.0, step=1000.0, key="lp_principal")
+            with col_b:
+                values["rate"] = st.number_input("Tasa anual", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="lp_rate")
+            with col_c:
+                values["periods"] = st.number_input("Plazo (periodos)", min_value=0, value=0, step=1, key="lp_periods")
+            col_d, col_e = st.columns(2)
+            with col_d:
+                values["rate_type"] = st.selectbox("Tipo de tasa", ["effective_annual", "nominal_annual", "effective_monthly"], index=0, key="lp_rate_type")
+            with col_e:
+                values["method"] = st.selectbox("Método", ["french", "german", "american"], index=0, key="lp_method")
+
+        elif problem_type == "present_value":
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                values["future_value"] = st.number_input("Valor futuro", min_value=0.0, value=0.0, step=1000.0, key="pv_future")
+            with col_b:
+                values["rate"] = st.number_input("Tasa anual", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="pv_rate")
+            with col_c:
+                values["periods"] = st.number_input("Plazo", min_value=0, value=0, step=1, key="pv_periods")
+
+        elif problem_type == "future_value":
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                values["present_value"] = st.number_input("Valor presente", min_value=0.0, value=0.0, step=1000.0, key="fv_present")
+            with col_b:
+                values["rate"] = st.number_input("Tasa anual", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="fv_rate")
+            with col_c:
+                values["periods"] = st.number_input("Plazo", min_value=0, value=0, step=1, key="fv_periods")
+
+        elif problem_type == "rate_conversion":
+            col_a, col_b = st.columns(2)
+            with col_a:
+                values["rate"] = st.number_input("Tasa", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="rc_rate")
+            with col_b:
+                values["from_type"] = st.selectbox("Convertir desde", ["effective_annual", "nominal_annual", "effective_monthly"], index=0, key="rc_from_type")
+
+        elif problem_type == "npv_irr":
+            st.markdown("Usa una lista simple de flujos separada por comas. Ejemplo: -1000, 300, 400, 500")
+            cashflows_text = st.text_input("Flujos de caja", value="", key="npv_cashflows")
+            values["discount_rate"] = st.number_input("Tasa de descuento", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="npv_discount_rate")
+            values["cashflows"] = [float(x.strip()) for x in cashflows_text.split(",") if x.strip()] if cashflows_text.strip() else []
+
+        elif problem_type == "real_return":
+            col_a, col_b = st.columns(2)
+            with col_a:
+                values["nominal_return"] = st.number_input("Rentabilidad nominal", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="rr_nominal")
+            with col_b:
+                values["inflation"] = st.number_input("Inflación", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="rr_inflation")
+
+        submit = st.form_submit_button("📦 Crear caja de cálculo", use_container_width=True)
+
+    if not submit:
+        return None
+
+    payload = _build_structured_problem_payload(problem_type, currency, values)
+    valid, message = _is_valid_structured_payload(payload)
+    if not valid:
+        st.warning(message)
+        return None
+
+    return payload
+
+
 def render_problem_solver_page():
     st.header("🧮 Problemas cotidianos")
     st.caption("Resuelve preguntas financieras en lenguaje natural con cálculo determinístico en Python y redacción ejecutiva asistida por LLM.")
 
-    question = st.text_area(
-        "Describe tu problema financiero",
-        placeholder="Ej: ¿Me conviene crédito A o B para comprar auto?"
+    input_mode = st.radio(
+        "Modo de entrada",
+        ["Formulario estructurado", "Texto libre asistido"],
+        index=0,
+        horizontal=True,
+        key="problem_solver_input_mode",
     )
+
+    question = ""
+    if input_mode == "Texto libre asistido":
+        question = st.text_area(
+            "Describe tu problema financiero",
+            placeholder="Ej: ¿Me conviene crédito A o B para comprar auto?"
+        )
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -509,30 +1382,41 @@ def render_problem_solver_page():
     with col3:
         st.text_input("Base de días", value="365", disabled=True)
 
-    if st.button("🧠 Interpretar problema", type="secondary", use_container_width=True):
-        if not question.strip():
-            st.warning("Escribe una pregunta antes de interpretar.")
-        else:
-            try:
-                with st.spinner("Interpretando y ordenando datos..."):
-                    parsed = _interpret_problem_to_json(question.strip(), currency)
-                    st.session_state.problem_source_question = question.strip()
-                    st.session_state.problem_draft = parsed["draft"]
-                    st.session_state.problem_draft_text = json.dumps(parsed["draft"], ensure_ascii=False, indent=2)
-                    st.session_state.problem_solver_metrics = {
-                        "parse_llm_calls": parsed["metrics"]["llm_calls"],
-                        "parse_cost": parsed["metrics"]["estimated_cost"],
-                        "narrative_llm_calls": 0,
-                        "narrative_cost": 0.0,
-                    }
-                    st.session_state.problem_solver_error = None
-            except Exception as e:
-                st.session_state.problem_solver_error = str(e)
+    if input_mode == "Texto libre asistido":
+        if st.button("🧠 Interpretar problema", type="secondary", use_container_width=True):
+            if not question.strip():
+                st.warning("Escribe una pregunta antes de interpretar.")
+            else:
+                try:
+                    with st.spinner("Interpretando y ordenando datos..."):
+                        parsed = _interpret_problem_to_json(question.strip(), currency)
+                        st.session_state.problem_source_question = question.strip()
+                        st.session_state.problem_draft = parsed["draft"]
+                        st.session_state.problem_draft_text = json.dumps(parsed["draft"], ensure_ascii=False, indent=2)
+                        st.session_state.problem_solver_metrics = {
+                            "parse_llm_calls": parsed["metrics"]["llm_calls"],
+                            "parse_cost": parsed["metrics"]["estimated_cost"],
+                            "narrative_llm_calls": 0,
+                            "narrative_cost": 0.0,
+                        }
+                        st.session_state.problem_solver_error = None
+                except Exception as e:
+                    st.session_state.problem_solver_error = str(e)
+    else:
+        structured_payload = _render_structured_problem_builder(currency)
+        if structured_payload:
+            st.session_state.problem_source_question = "Formulario estructurado"
+            st.session_state.problem_draft = structured_payload
+            st.session_state.problem_draft_text = json.dumps(structured_payload, ensure_ascii=False, indent=2)
+            st.session_state.problem_solver_metrics = {
+                "parse_llm_calls": 0,
+                "parse_cost": 0.0,
+                "narrative_llm_calls": 0,
+                "narrative_cost": 0.0,
+            }
+            st.session_state.problem_solver_error = None
 
     if st.session_state.get("problem_draft_text"):
-        st.subheader("📋 Datos reordenados (requiere autorización humana)")
-        st.caption("Revisa y edita el JSON antes de resolver. El cálculo solo corre cuando autorizas.")
-
         draft_dict = st.session_state.get("problem_draft", {})
         defaults_used = draft_dict.get("defaults_used", [])
         
@@ -555,36 +1439,6 @@ def render_problem_solver_page():
                 unsafe_allow_html=True
             )
 
-        edited = st.text_area(
-            "JSON autorizado",
-            value=st.session_state.problem_draft_text,
-            height=360,
-            key="problem_solver_json_editor",
-        )
-
-        if st.button("✅ Autorizar y resolver", type="primary", use_container_width=True):
-            try:
-                authorized_payload = json.loads(edited)
-                solved = _solve_authorized_problem(authorized_payload)
-                narrative = _generate_problem_narrative(question.strip(), solved)
-
-                metrics = st.session_state.problem_solver_metrics or {
-                    "parse_llm_calls": 0,
-                    "parse_cost": 0.0,
-                    "narrative_llm_calls": 0,
-                    "narrative_cost": 0.0,
-                }
-                metrics["narrative_llm_calls"] = narrative["metrics"]["llm_calls"]
-                metrics["narrative_cost"] = narrative["metrics"]["estimated_cost"]
-                metrics["total_llm_calls"] = metrics["parse_llm_calls"] + metrics["narrative_llm_calls"]
-                metrics["total_cost"] = metrics["parse_cost"] + metrics["narrative_cost"]
-
-                st.session_state.problem_solver_result = solved
-                st.session_state.problem_solver_narrative = narrative["text"]
-                st.session_state.problem_solver_metrics = metrics
-                st.session_state.problem_solver_error = None
-            except Exception as e:
-                st.session_state.problem_solver_error = str(e)
 
     if st.session_state.get("problem_solver_error"):
         st.error(f"Error en resolución: {st.session_state.problem_solver_error}")
@@ -618,93 +1472,105 @@ def render_problem_solver_page():
 
 
 def _generate_executive_summary(result: dict, income: float, expenses: float, savings: float, savings_rate: float, health_status: str) -> str:
-    """Generate a professional narrative executive summary"""
-    
-    categories = result.get('category_analysis', [])
-    ratios = result.get('ratios', {})
-    
-    # Calculate category totals
+    """Generate a professional narrative executive summary.
+
+    This version escapes Markdown-sensitive characters in inserted text and formats
+    numeric values consistently to avoid unintended font/format changes in Streamlit.
+    """
+
+    import html
+
+    def esc(text: str) -> str:
+        if text is None:
+            return ""
+        return html.escape(str(text), quote=False)
+
+    categories = result.get('category_analysis', []) or []
+
+    # Calculate category totals (robust to missing data)
     fixed_categories = ['bills_utilities', 'fees']
     variable_categories = ['groceries', 'transportation']
-    
-    total_fixed = 0
-    total_variable = 0
-    total_discretionary = 0
-    
+
+    total_fixed = 0.0
+    total_variable = 0.0
+    total_discretionary = 0.0
+
     for cat in categories:
         cat_name = cat.get('category', '')
-        spent = cat.get('spent', 0)
-        
+        spent = float(cat.get('spent') or 0)
         if cat_name in fixed_categories:
             total_fixed += spent
         elif cat_name in variable_categories:
             total_variable += spent
         else:
             total_discretionary += spent
-    
-    fixed_pct = (total_fixed / expenses * 100) if expenses > 0 else 0
-    variable_pct = (total_variable / expenses * 100) if expenses > 0 else 0
-    discretionary_pct = (total_discretionary / expenses * 100) if expenses > 0 else 0
-    
-    # Build narrative
-    summary = []
-    
-    # Opening
+
+    # Safe formatting helpers
+    def fmt_money(x):
+        try:
+            return f"${float(x):,.2f}"
+        except Exception:
+            return f"{x}"
+
+    def pct(part, whole):
+        try:
+            return (float(part) / float(whole) * 100) if float(whole) != 0 else 0.0
+        except Exception:
+            return 0.0
+
+    fixed_pct = pct(total_fixed, expenses)
+    variable_pct = pct(total_variable, expenses)
+    discretionary_pct = pct(total_discretionary, expenses)
+
+    income_s = fmt_money(income)
+    expenses_s = fmt_money(expenses)
+    savings_s = fmt_money(savings)
+    fixed_s = fmt_money(total_fixed)
+    variable_s = fmt_money(total_variable)
+    discretionary_s = fmt_money(total_discretionary)
+
+    # Build narrative as controlled HTML to avoid Markdown formatting side effects
     if health_status == "good":
-        summary.append("**Situación Financiera General:** Tu perfil financiero muestra una posición sólida y estable. "
-                      "Con ingresos mensuales de ${:.2f} y gastos de ${:.2f}, logras un ahorro neto de ${:.2f} "
-                      "(equivalente al {:.1f}% de tus ingresos), lo que te posiciona en una trayectoria de crecimiento patrimonial."
-                      .format(income, expenses, savings, savings_rate * 100))
+        opening = (f"<p><strong>Situación Financiera General:</strong> Tu perfil financiero muestra una posición sólida y estable. "
+                   f"Con ingresos mensuales de {income_s} y gastos de {expenses_s}, logras un ahorro neto de {savings_s} "
+                   f"(equivalente al {savings_rate*100:.1f}% de tus ingresos).</p>")
     elif health_status == "risk":
-        summary.append("**Situación Financiera General:** Tu perfil financiero requiere atención inmediata. "
-                      "Actualmente gastas ${:.2f} de cada ${:.2f} que ganas, dejando tan solo ${:.2f} de ahorro mensual ({:.1f}%). "
-                      "Existen oportunidades claras de optimización que deben abordarse con urgencia."
-                      .format(expenses, income, savings, savings_rate * 100))
+        opening = (f"<p><strong>Situación Financiera General:</strong> Tu perfil financiero requiere atención inmediata. "
+                   f"Actualmente gastas {expenses_s} de cada {income_s} que ganas, dejando tan solo {savings_s} de ahorro mensual ({savings_rate*100:.1f}%). "
+                   f"Existen oportunidades claras de optimización que deben abordarse con urgencia.</p>")
     else:
-        summary.append("**Situación Financiera General:** Tu perfil financiero es neutral. "
-                      "Con ingresos de ${:.2f} y gastos de ${:.2f}, logras un ahorro de ${:.2f} ({:.1f}%). "
-                      "Hay margen para mejora en varios aspectos de tu gestión financiera."
-                      .format(income, expenses, savings, savings_rate * 100))
-    
-    # Expense breakdown narrative
-    summary.append("\n**Estructura de Gastos:** Tu gasto total se distribuye en tres categorías clave. "
-                  "Los **gastos fijos** (vivienda, servicios, seguros) representan **{:.0f}% del presupuesto** (${:.2f}), "
-                  "lo que está dentro de rangos saludables. Los **gastos variables** (alimentos, transporte) constituyen **{:.0f}%** (${:.2f}), "
-                  "reflejando necesidades cotidianas regulares. Finalmente, los **gastos discrecionales** (entretenimiento, compras, suscripciones) "
-                  "alcanzan **{:.0f}%** (${:.2f})."
-                  .format(fixed_pct, total_fixed, variable_pct, total_variable, discretionary_pct, total_discretionary))
-    
-    # Key insights
+        opening = (f"<p><strong>Situación Financiera General:</strong> Tu perfil financiero es neutral. "
+                   f"Con ingresos de {income_s} y gastos de {expenses_s}, logras un ahorro de {savings_s} ({savings_rate*100:.1f}%). "
+                   f"Hay margen para mejora en varios aspectos de tu gestión financiera.</p>")
+
+    breakdown = (f"<p><strong>Estructura de Gastos:</strong> Tu gasto total se distribuye en tres categorías clave. "
+                 f"Los gastos fijos representan {fixed_pct:.0f}% del presupuesto ({fixed_s}). "
+                 f"Los gastos variables representan {variable_pct:.0f}% ({variable_s}). "
+                 f"Los gastos discrecionales alcanzan {discretionary_pct:.0f}% ({discretionary_s}).</p>")
+
     if discretionary_pct > 25:
-        summary.append("\n**Hallazgo Principal:** Se identifica un nivel significativo de gasto discrecional ({:.0f}%), "
-                      "lo que representa la principal área de optimización. Este segmento incluye suscripciones, compras impulsivas, "
-                      "entretenimiento y dining out. Reducir este categoría solo al 15-20% del presupuesto podría liberar "
-                      "${:.2f} adicionales mensuales para ahorros e inversión."
-                      .format(discretionary_pct, total_discretionary * 0.40))
+        finding = (f"<p><strong>Hallazgo Principal:</strong> Se identifica un nivel significativo de gasto discrecional ({discretionary_pct:.0f}%). "
+                   f"Reducir esta categoría hacia 15-20% podría liberar aproximadamente {fmt_money(total_discretionary * 0.40)} mensuales para ahorros e inversión.</p>")
     elif discretionary_pct > 15:
-        summary.append("\n**Hallazgo Principal:** El gasto discrecional está en un nivel moderado ({:.0f}%). "
-                      "Aunque controlado, aún existe potencial para mejorar mediante pequeños ajustes en suscripciones "
-                      "y entretenimiento, liberando aproximadamente ${:.2f} mensuales."
-                      .format(discretionary_pct, total_discretionary * 0.25))
+        finding = (f"<p><strong>Hallazgo Principal:</strong> El gasto discrecional está en un nivel moderado ({discretionary_pct:.0f}%). "
+                   f"Pequeños ajustes podrían liberar cerca de {fmt_money(total_discretionary * 0.25)} mensuales.</p>")
     else:
-        summary.append("\n**Hallazgo Principal:** El gasto discrecional está bien controlado en {:.0f}%. "
-                      "Mantienes una disciplina sólida en áreas de discreción, lo que facilita tu capacidad de ahorro."
-                      .format(discretionary_pct))
-    
-    # Recommendations section
-    summary.append("\n**Recomendaciones Estratégicas:** Basado en este análisis, se sugieren las siguientes acciones: "
-                  "(1) Revisar la sección de **Recomendaciones** arriba para estrategias específicas; "
-                  "(2) Implementar un **presupuesto categorizado** usando la proporción 50/30/20 adaptada a tu perfil; "
-                  "(3) Automatizar transferencias de ahorro tan pronto se recibe el ingreso; "
-                  "(4) Monitorear regularmente el **Análisis de Gastos por Categoría** para detectar desviaciones temprano.")
-    
-    # Closing
-    summary.append("\n**Próximos Pasos:** Para traducir este análisis en mejoras concretas, consulta la sección de "
-                  "**Ratios Financieros** para contexto de tu posición relativa, revisa los **Problemas Detectados** "
-                  "si existen, y considera implementar las acciones listadas en **Recomendaciones**. Vuelve a generar este "
-                  "reporte mensualmente para monitorear tu progreso hacia tus objetivos financieros.")
-    
-    return "\n".join(summary)
+        finding = (f"<p><strong>Hallazgo Principal:</strong> El gasto discrecional está bien controlado en {discretionary_pct:.0f}%. "
+                   f"Mantienes una disciplina sólida en áreas de discreción.</p>")
+
+    recommendations = ("<p><strong>Recomendaciones Estratégicas:</strong> Basado en este análisis, se sugieren las siguientes acciones: "
+                       "(1) Revisar las suscripciones y gastos recurrentes; "
+                       "(2) Implementar un presupuesto categorizado adaptado a tu perfil; "
+                       "(3) Automatizar transferencias a ahorro justo al recibir ingresos.</p>")
+
+    next_steps = ("<p><strong>Próximos Pasos:</strong> Consulta la sección de Ratios Financieros para contexto, revisa los Problemas Detectados si existen, "
+                  "y considera implementar las acciones listadas en Recomendaciones. Genera este reporte mensualmente para monitorear progreso.</p>")
+
+    # Assemble paragraphs (escape variable fragments if needed). We escape only
+    # values derived from user data; the template's Markdown (bold headings)
+    # remains intact so headings render correctly.
+    paragraphs = [opening, breakdown, finding, recommendations, next_steps]
+    return "".join(paragraphs)
 
 
 def _render_meta_analysis_result(meta_state: dict):
@@ -915,7 +1781,7 @@ def _render_meta_analysis_result(meta_state: dict):
     st.markdown("## 📄 Resumen Ejecutivo")
     
     executive_summary = _generate_executive_summary(result, income, expenses, savings, savings_rate, health_status)
-    st.markdown(executive_summary)
+    st.markdown(executive_summary, unsafe_allow_html=True)
     
     st.divider()
     
