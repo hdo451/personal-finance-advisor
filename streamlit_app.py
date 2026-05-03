@@ -25,7 +25,8 @@ except ImportError:
 
 # Import your system
 from main_coordinator import BankStatementAnalyzer
-from utils.financial_solver import solve_problem
+from utils.financial_solver import solve_problem, loan_payment
+from utils.financial_calculator import FinancialCalculator
 
 KNOWLEDGE_BASE_PATH = Path(__file__).resolve().parent / "data" / "advisory_knowledge_base_v1.json"
 
@@ -504,60 +505,456 @@ def _apply_financial_defaults(payload: dict) -> dict:
     return normalized
 
 
+def _heuristic_parse_refinance(text: str, currency: str) -> dict:
+    """Heuristically extract numeric fields from a refinance/offer text.
+
+    This is a simple fallback when the LLM cannot populate the structured form.
+    It recognizes common money patterns and plausible fields used in refinance cases.
+    """
+    # Normalize text
+    t = str(text)
+
+    def parse_money(value: str) -> float:
+        cleaned = str(value).replace(',', '').replace('$', '').strip().rstrip('.')
+        return float(cleaned)
+
+    def find_first_amount(patterns: list[str], source: str) -> float | None:
+        for pattern in patterns:
+            match = re.search(pattern, source, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                for group in match.groups():
+                    if group:
+                        try:
+                            return parse_money(group)
+                        except Exception:
+                            continue
+        return None
+
+    # find dollar amounts like $19,437.43 or 19,437.43
+    amounts = [parse_money(a) for a in re.findall(r"\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)", t)]
+
+    # small helper to search approximate integers (months, payments)
+    months = [int(m) for m in re.findall(r"(\b\d{1,3})\s*(?:pagos|meses|payments|months)\b", t, flags=re.IGNORECASE)]
+
+    # try to assign most relevant amounts by heuristics
+    principal = None
+    payoff = None
+    monthly = None
+    new_capital = None
+    fees = None
+    total_obligation = None
+
+    # Extract values tied to the current loan explicitly.
+    principal = find_first_amount([
+        r"capital pendiente\s*(?:ser[íi]a de|:)?\s*\$?\s*([0-9.,]+)",
+        r"capital pendiente[^0-9\$]*\$?\s*([0-9.,]+)",
+    ], t)
+
+    payoff = find_first_amount([
+        r"monto necesario para liquidar completamente la deuda\s*es de\s*\$?\s*([0-9.,]+)",
+        r"monto necesario[^0-9\$]*\$?\s*([0-9.,]+)",
+        r"liquidar completamente la deuda\s*es de\s*\$?\s*([0-9.,]+)",
+        r"payoff[^0-9\$]*\$?\s*([0-9.,]+)",
+        r"cifra válida hasta .*?\$?\s*([0-9.,]+)",
+    ], t)
+
+    monthly = find_first_amount([
+        r"cuota mensual actual[^0-9\$]*\$?\s*([0-9.,]+)",
+        r"cuota mensual[^0-9\$]*\$?\s*([0-9.,]+)",
+    ], t)
+
+    period_match = re.search(r"cerca de\s*([0-9]{1,3})\s*pagos mensuales", t, flags=re.IGNORECASE)
+    if not period_match:
+        period_match = re.search(r"([0-9]{1,3})\s*pagos mensuales", t, flags=re.IGNORECASE)
+
+    # Extract values tied to the new offer explicitly.
+    new_capital = find_first_amount([
+        r"entregar\s*\$?\s*([0-9.,]+)\s*como nuevo capital",
+        r"nuevo capital financiado\s*,?\s*con un cargo fijo",
+    ], t)
+
+    fees = find_first_amount([
+        r"cargo fijo adicional de\s*\$?\s*([0-9.,]+)",
+        r"cargo fijo\s*\$?\s*([0-9.,]+)",
+        r"cargos? por intereses?[^0-9\$]*\$?\s*([0-9.,]+)",
+    ], t)
+
+    total_obligation = find_first_amount([
+        r"obligaci[oó]n total de pago futura\s*\$?\s*([0-9.,]+)",
+        r"obligaci[oó]n total[^0-9\$]*\$?\s*([0-9.,]+)",
+    ], t)
+
+    # Keep a useful fallback, but only if we still lack a specific value.
+    if payoff is None and amounts:
+        payoff = max(amounts)
+    if principal is None and amounts:
+        smaller_amounts = [a for a in amounts if a < (payoff or float('inf'))]
+        if smaller_amounts:
+            principal = max(smaller_amounts)
+    if monthly is None and amounts:
+        monthly_candidates = [a for a in amounts if 100.0 <= a <= 5000.0]
+        if monthly_candidates:
+            monthly = min(monthly_candidates, key=lambda a: abs(a - 605.0))
+    if new_capital is None and amounts:
+        offer_candidates = [a for a in amounts if a not in {principal, payoff, monthly, total_obligation}]
+        if offer_candidates:
+            new_capital = max(offer_candidates)
+
+    period = None
+    if period_match:
+        period = int(period_match.group(1))
+    elif months:
+        period = months[0]
+
+    # Build a compare-loans payload that can directly prime the structured form.
+    proposed_periods = int(period) if period else 0
+    if proposed_periods <= 0 and monthly and total_obligation:
+        proposed_periods = 63
+
+    proposed_monthly = 0.0
+    if total_obligation and proposed_periods > 0:
+        try:
+            proposed_monthly = round(float(total_obligation) / float(proposed_periods), 2)
+        except Exception:
+            proposed_monthly = 0.0
+
+    draft = {
+        "problem_type": "compare_loans",
+        "currency": currency,
+        "inputs": {
+            "loans": [
+                {
+                    "name": "Crédito actual",
+                    "principal": principal or 0.0,
+                    "rate": 0.0,
+                    "rate_type": "effective_annual",
+                    "periods": int(period) if period else 0,
+                    "monthly_payment": monthly or 0.0,
+                    "fees_capitalized": 0.0,
+                    "total_obligation": payoff or 0.0,
+                    "method": "french",
+                },
+                {
+                    "name": "Oferta nueva",
+                    "principal": new_capital or 0.0,
+                    "rate": 0.0,
+                    "rate_type": "effective_annual",
+                    "periods": proposed_periods,
+                    "monthly_payment": proposed_monthly,
+                    "fees_capitalized": fees or 0.0,
+                    "total_obligation": total_obligation or 0.0,
+                    "method": "french",
+                },
+            ]
+        },
+        "assumptions": [
+            "Heurística local aplicada: campos extraídos por regex",
+            "La oferta nueva se normalizó como comparación de dos préstamos para poder llenar el formulario.",
+            "Cuando no aparece plazo explícito para la oferta nueva, se reutiliza el plazo del crédito actual o 63 meses como referencia operativa.",
+        ],
+        "defaults_used": [],
+        "ambiguity_disclosure": "Se usó un parser heurístico; revisa y ajusta los campos antes de autorizar.",
+    }
+
+    return draft
+
+
+def _heuristic_parse_asset_options(text: str, currency: str) -> dict:
+    """Heuristic parser for compare_asset_options: purchase / lease / rent.
+
+    Extracts simple option rows from free text. This is intentionally
+    conservative: it fills informational fields (upfront, monthly, term, residual)
+    so the structured form can be primed instead of misplacing values into
+    credit-compare drafts.
+    """
+    t = str(text)
+    lowered = t.lower()
+
+    def parse_money(value: str) -> float:
+        cleaned = str(value).replace(',', '').replace('$', '').strip().rstrip('.')
+        try:
+            return float(cleaned)
+        except Exception:
+            return 0.0
+
+    def money_after(patterns: list[str], source: str) -> float:
+        for pat in patterns:
+            m = re.search(pat, source, flags=re.I | re.S)
+            if m:
+                return parse_money(m.group(1))
+        return 0.0
+
+    def int_after(patterns: list[str], source: str) -> int:
+        for pat in patterns:
+            m = re.search(pat, source, flags=re.I | re.S)
+            if m:
+                try:
+                    return int(m.group(1))
+                except Exception:
+                    pass
+        return 0
+
+    def parse_financing_monthly(principal_amount: float, annual_rate: float, periods: int) -> float:
+        if principal_amount <= 0 or annual_rate <= 0 or periods <= 0:
+            return 0.0
+        try:
+            result = loan_payment({
+                "principal": principal_amount,
+                "rate": annual_rate,
+                "rate_type": "effective_annual",
+                "periods": periods,
+                "method": "french",
+            })
+            return float(result.get("result", {}).get("estimated_payment", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    options = []
+
+    # Prefer explicit option blocks when the text is written as numbered alternatives.
+    block_markers = [
+        ("leasing", r"(?:la\s+)?primera\s+opci[oó]n.*?(?=(?:la\s+)?segunda\s+opci[oó]n|(?:la\s+)?tercera\s+opci[oó]n|$)"),
+        ("rent", r"(?:la\s+)?segunda\s+opci[oó]n.*?(?=(?:la\s+)?tercera\s+opci[oó]n|$)"),
+        ("purchase", r"(?:la\s+)?tercera\s+opci[oó]n.*?$"),
+    ]
+    blocks = []
+    for opt_type, pattern in block_markers:
+        match = re.search(pattern, lowered, flags=re.I | re.S)
+        if match:
+            blocks.append((opt_type, t[match.start():match.end()]))
+
+    if blocks:
+        for opt_type, block in blocks:
+            if opt_type == "leasing":
+                monthly = money_after([
+                    r"pagos?\s+mensuales?.{0,40}?\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+                    r"cuotas?\s+mensuales?.{0,40}?\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+                    r"\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)\s+mxn\s+por\s+48\s+meses",
+                ], block)
+                maint = money_after([
+                    r"tendr[ií]a\s+que\s+pagar\s+\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)\s+de\s+mantenci[oó]n",
+                    r"mensualmente\s+tendr[ií]a\s+que\s+pagar\s+\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)\s+de\s+mantenci[oó]n",
+                    r"mantenci[oó]n.{0,30}?\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+                    r"mantenimiento.{0,30}?\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+                ], block)
+                residual = money_after([
+                    r"valor\s+residual.{0,30}?\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+                    r"opci[oó]n\s+de\s+compra.{0,30}?\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+                ], block)
+                term = int_after([r"(\d{1,3})\s*meses"], block)
+                options.append({
+                    "name": "Leasing",
+                    "option_type": "leasing",
+                    "upfront_payment": 0.0,
+                    "monthly_payment": float(monthly + maint),
+                    "term_months": int(term or 48),
+                    "residual_value": float(residual),
+                    "maintenance_monthly": float(maint),
+                    "maintenance_included": False,
+                    "residual_timing_months": int(term or 48),
+                })
+            elif opt_type == "rent":
+                monthly = money_after([
+                    r"renta\s+operativa\s+por\s+\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)\s+mensuales?",
+                    r"\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)\s+mxn\s+mensuales?",
+                    r"mensuales?.{0,25}?\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+                ], block)
+                term_years = int_after([r"(\d{1,2})\s*a[nñ]os"], block)
+                term_months = term_years * 12 if term_years > 0 else int_after([r"(\d{1,3})\s*meses"], block)
+                options.append({
+                    "name": "Renta Operativa",
+                    "option_type": "rent",
+                    "upfront_payment": 0.0,
+                    "monthly_payment": float(monthly),
+                    "term_months": int(term_months or 36),
+                    "residual_value": 0.0,
+                    "maintenance_included": True,
+                    "residual_timing_months": int(term_months or 36),
+                })
+            else:
+                price = money_after([
+                    r"cuesta\s+\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+                    r"precio\s+de\s+compra.{0,20}?\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+                    r"comprarla\s+directamente\..{0,40}?\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+                ], block)
+                financing = money_after([r"l[ií]nea\s+de\s+cr[eé]dito:\s*\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)"], block)
+                annual_rate = money_after([r"tasa\s+del\s*([0-9]{1,3}(?:[.,][0-9]{1,4})?)\s*%\s*anual"], block) / 100.0
+                pay_years = int_after([r"(\d{1,2})\s*a[nñ]os"], block)
+                financing_months = pay_years * 12 if pay_years > 0 else 24
+                residual = money_after([
+                    r"valor\s+residual\s+cercano\s+a\s+\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+                    r"valor\s+residual.{0,30}?\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+                ], block)
+                upfront = max((price - financing), 0.0) if price and financing else float(price)
+                monthly = parse_financing_monthly(financing, annual_rate, financing_months) if financing and annual_rate and financing_months else 0.0
+                options.append({
+                    "name": "Compra",
+                    "option_type": "purchase",
+                    "upfront_payment": float(upfront),
+                    "monthly_payment": float(monthly),
+                    "term_months": int(financing_months or 24),
+                    "residual_value": float(residual),
+                    "residual_timing_months": 96,
+                })
+
+    # Fallback: if we still couldn't isolate the three blocks, use broad keyword scanning.
+    if len(options) < 2:
+        lines = [ln.strip() for ln in re.split(r"[\n;]+", t) if ln.strip()]
+        for ln in lines:
+            if not re.search(r"\d", ln):
+                continue
+            if re.search(r"\bleasing\b|\blease\b", ln, flags=re.I):
+                monthly = money_after([r"(\$?\s*[0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)"], ln)
+                residual = money_after([r"residual.{0,30}?(\$?\s*[0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)"], ln)
+                term = int_after([r"(\d{1,3})\s*meses"], ln)
+                options.append({
+                    "name": "Leasing",
+                    "option_type": "leasing",
+                    "upfront_payment": 0.0,
+                    "monthly_payment": float(monthly),
+                    "term_months": int(term or 48),
+                    "residual_value": float(residual),
+                    "residual_timing_months": int(term or 48),
+                })
+            elif re.search(r"\brenta\b|\barrend|\barriendo\b|\brent\b", ln, flags=re.I):
+                monthly = money_after([r"(\$?\s*[0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)"], ln)
+                term = int_after([r"(\d{1,3})\s*meses", r"(\d{1,2})\s*a[nñ]os"], ln)
+                options.append({
+                    "name": "Renta Operativa",
+                    "option_type": "rent",
+                    "upfront_payment": 0.0,
+                    "monthly_payment": float(monthly),
+                    "term_months": int(term or 36),
+                    "residual_value": 0.0,
+                    "maintenance_included": True,
+                })
+            elif re.search(r"\bcompra\b|\bprecio\b", ln, flags=re.I):
+                price = money_after([r"(\$?\s*[0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)"], ln)
+                residual = money_after([r"residual.{0,30}?(\$?\s*[0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)"], ln)
+                options.append({
+                    "name": "Compra",
+                    "option_type": "purchase",
+                    "upfront_payment": float(price),
+                    "monthly_payment": 0.0,
+                    "term_months": 96,
+                    "residual_value": float(residual),
+                    "residual_timing_months": 96,
+                })
+
+    if not options:
+        amounts = [parse_money(a) for a in re.findall(r"\$?\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)", t)]
+        if amounts:
+            options = [{
+                "name": "Opción 1",
+                "option_type": "purchase",
+                "upfront_payment": float(amounts[0]),
+                "monthly_payment": 0.0,
+                "term_months": 0,
+                "residual_value": 0.0,
+            }]
+
+    draft = {
+        "problem_type": "compare_asset_options",
+        "currency": currency,
+        "inputs": {
+            "horizon_months": 96,
+            "discount_rate": 0.10,
+            "rate_type": "effective_annual",
+            "options": options,
+        },
+        "assumptions": [
+            "Heurística de activos aplicada: se separaron compra, leasing y renta operativa.",
+            "Para la compra se trató la línea de crédito como financiamiento de la parte no cubierta por reservas.",
+        ],
+        "defaults_used": [],
+        "ambiguity_disclosure": "Se usó un parser heurístico para opciones de compra/leasing/renta; revisa y ajusta los campos.",
+    }
+    return draft
+
+
 def _interpret_problem_to_json(question: str, currency: str) -> dict:
     llm = st.session_state.analyzer.llm
     calls_before = llm.call_count
     cost_before = llm.total_cost
 
-    system_prompt = """You are a financial math problem parser.
-Convert a free-form user question into a normalized JSON payload for a deterministic calculator.
+    system_prompt = (
+        "You are a financial math problem parser.\n"
+        "Convert a free-form user question into a normalized JSON payload for a deterministic calculator.\n\n"
+        "Supported problem_type values:\n"
+        "- present_value\n"
+        "- future_value\n"
+        "- loan_payment\n"
+        "- compare_loans\n"
+        "- compare_asset_options\n"
+        "- rate_conversion\n"
+        "- refinance\n"
+        "- npv_irr\n"
+        "- real_return\n"
+        "- debt_structures\n"
+        "- debt_payment_alternatives\n\n"
+        "Rules:\n"
+        "- Return only valid JSON.\n"
+        "- If values (like interest rates, periods) are missing, you MUST inject reasonable numeric defaults directly into the inputs (e.g., 0.35 / 35% for a credit card rate, or 0.10 for personal loans, 0.08 for mortgages).\n"
+        "- You MUST document these injected assumptions specifically in the \"defaults_used\" array (e.g. \"Tasa de tarjeta de crédito asumida: 35% anual\").\n"
+        "- If ambiguity exists, explain it in ambiguity_disclosure.\n"
+        "- Use periodicity monthly and day_basis 365 unless user states otherwise.\n"
+        "- For loan comparisons: ALWAYS include these fields in each loan object: name, principal, rate, rate_type, periods, monthly_payment, fees_capitalized, total_obligation, method.\n"
+        "  * If user provides monthly payment (e.g., 'cuota de $605'), use it and set rate=0 (it will be inferred later).\n"
+        "  * If user provides total obligation, calculate monthly_payment by dividing by periods.\n"
+        "  * If user provides neither payment nor obligation, inject a reasonable default and document it in defaults_used.\n"
+        "- Do not omit fields that are already inferable from the question; if you must assume a default, keep it numeric and record it in defaults_used.\n\n"
+        "Required output shape:\n"
+        "{\n"
+        '  "problem_type": "...",\n'
+        '  "currency": "MXN|USD",\n'
+        '  "day_basis": 365,\n'
+        '  "periodicity": "monthly",\n'
+        '  "inputs": { ... },\n'
+        '  "assumptions": ["..."],\n'
+        '  "defaults_used": ["..."],\n'
+        '  "ambiguity_disclosure": "..."\n'
+        "}"
+    )
 
-Supported problem_type values:
-- present_value
-- future_value
-- loan_payment
-- compare_loans
-- compare_asset_options
-- rate_conversion
-- refinance
-- npv_irr
-- real_return
-- debt_structures
-- debt_payment_alternatives
+    user_prompt = (
+        f"User question: {question}\n"
+        f"Currency preference: {currency}"
+    )
 
-Rules:
-- Return only valid JSON.
-- If values (like interest rates, periods) are missing, you MUST inject reasonable numeric defaults directly into the inputs (e.g., 0.35 / 35% for a credit card rate, or 0.10 for personal loans, 0.08 for mortgages).
-- You MUST document these injected assumptions specifically in the "defaults_used" array (e.g. "Tasa de tarjeta de crédito asumida: 35% anual").
-- If ambiguity exists, explain it in ambiguity_disclosure.
-- Use periodicity monthly and day_basis 365 unless user states otherwise.
-- Prefer fields that can directly populate structured form boxes. For loan comparisons, return each loan as an object with name, principal, rate, rate_type, periods, and method.
-- Do not omit fields that are already inferable from the question; if you must assume a default, keep it numeric and record it in defaults_used.
+    parser_used = "llm"
+    try:
+        low = question.lower()
+        forced_asset = bool(re.search(r"\b(primera|segunda|tercera)\s+opci[oó]n\b|\bleasing\b|\brenta\b|\barrend\b|\bcompra\b", low))
+        if forced_asset:
+            parsed = _heuristic_parse_asset_options(question, currency)
+            parser_used = "heuristic_asset"
+        else:
+            response = llm.make_call(user_prompt, system_prompt, expect_json=True)
+            if not response:
+                response = llm.make_call(user_prompt, system_prompt, expect_json=False)
+            if not response:
+                raise ValueError("No se pudo interpretar la pregunta con LLM.")
 
-Required output shape:
-{
-  "problem_type": "...",
-  "currency": "MXN|USD",
-  "day_basis": 365,
-  "periodicity": "monthly",
-  "inputs": { ... },
-  "assumptions": ["..."],
-  "defaults_used": ["..."],
-  "ambiguity_disclosure": "..."
-}
-"""
+            parsed = _extract_json_response(response)
+    except Exception:
+        # LLM failed or returned non-usable JSON. Choose a heuristic fallback
+        # based on keywords so we don't always map asset comparisons to refinance.
+        low = question.lower()
+        if re.search(r"\b(compra|leasing|lease|renta|arrend|\barriendo)\b", low):
+            parsed = _heuristic_parse_asset_options(question, currency)
+            parser_used = "heuristic_asset"
+        else:
+            parsed = _heuristic_parse_refinance(question, currency)
+            parser_used = "heuristic"
 
-    user_prompt = f"""User question: {question}
-Currency preference: {currency}
-"""
-
-    response = llm.make_call(user_prompt, system_prompt, expect_json=True)
-    if not response:
-        response = llm.make_call(user_prompt, system_prompt, expect_json=False)
-    if not response:
-        raise ValueError("No se pudo interpretar la pregunta.")
-
-    parsed = _extract_json_response(response)
+    # Normalize refinance drafts to compare_loans for the UI
+    parsed = _normalize_draft_for_compare_loans(parsed)
+    # Record which parser produced the draft
+    try:
+        if isinstance(parsed, dict):
+            parsed["_parser_used"] = parser_used
+    except Exception:
+        pass
 
     calls_used = llm.call_count - calls_before
     cost_used = llm.total_cost - cost_before
@@ -582,6 +979,270 @@ def _solve_authorized_problem(authorized_payload: dict) -> dict:
     }
     solved["trace"]["assumptions"] = deterministic_payload.get("assumptions", []) + deterministic_payload.get("defaults_used", [])
     return solved
+
+
+def _normalize_draft_for_compare_loans(parsed: dict) -> dict:
+    """Normalize refinance-like drafts into compare_loans drafts for the UI."""
+    if not isinstance(parsed, dict):
+        return parsed
+
+    ptype = (parsed.get("problem_type") or parsed.get("type") or "").lower().strip()
+    if ptype != "refinance":
+        return parsed
+
+    inputs = parsed.get("inputs", {}) or {}
+    cur = inputs.get("current_loan", {}) or parsed.get("current_loan", {})
+    prop = inputs.get("proposed_loan", {}) or parsed.get("proposed_loan", {})
+    current_periods = int(cur.get("periods", 0) or 0)
+    proposed_periods = int(prop.get("periods", 0) or 0) or current_periods or 63
+    proposed_monthly = prop.get("monthly_payment")
+    if not proposed_monthly and prop.get("total_obligation") and proposed_periods > 0:
+        try:
+            proposed_monthly = round(float(prop.get("total_obligation", 0.0)) / float(proposed_periods), 2)
+        except Exception:
+            proposed_monthly = 0.0
+
+    return {
+        "problem_type": "compare_loans",
+        "currency": parsed.get("currency", "USD"),
+        "inputs": {
+            "loans": [
+                {
+                    "name": cur.get("name", "Crédito actual"),
+                    "principal": cur.get("principal", 0.0),
+                    "rate": cur.get("rate", 0.0),
+                    "rate_type": cur.get("rate_type", "effective_annual"),
+                    "periods": current_periods,
+                    "monthly_payment": cur.get("monthly_payment", 0.0),
+                    "fees_capitalized": cur.get("fees_capitalized", 0.0),
+                    "total_obligation": cur.get("total_obligation", 0.0),
+                    "method": cur.get("method", "french"),
+                },
+                {
+                    "name": prop.get("name", "Oferta nueva"),
+                    "principal": prop.get("principal", 0.0),
+                    "rate": prop.get("rate", 0.0),
+                    "rate_type": prop.get("rate_type", "effective_annual"),
+                    "periods": proposed_periods,
+                    "monthly_payment": proposed_monthly or 0.0,
+                    "fees_capitalized": prop.get("fees_capitalized", 0.0),
+                    "total_obligation": prop.get("total_obligation", 0.0),
+                    "method": prop.get("method", "french"),
+                },
+            ]
+        },
+        "assumptions": parsed.get("assumptions", []) + ["Refinance normalizado a comparación de préstamos."],
+        "defaults_used": parsed.get("defaults_used", []),
+        "ambiguity_disclosure": parsed.get("ambiguity_disclosure", ""),
+    }
+
+
+def _mark_assumed_fields(loans: list[dict], extracted_fields: dict) -> list[dict]:
+    """
+    Mark which fields in each loan were assumed vs extracted from text.
+    
+    Args:
+        loans: List of loan dicts from parsed draft
+        extracted_fields: Dict tracking which fields were explicitly extracted
+        
+    Returns:
+        List of loans with 'assumed_fields' key listing which fields are defaults
+    """
+    marked_loans = []
+    
+    for idx, loan in enumerate(loans):
+        assumed = []
+        
+        # Common fields that might be assumed
+        for field in ['rate', 'monthly_payment', 'periods', 'fees_capitalized']:
+            value = loan.get(field, 0)
+            # Consider it assumed if it's 0 or wasn't in extracted_fields
+            if value == 0 or value is None:
+                assumed.append(field)
+        
+        loan_copy = copy.deepcopy(loan)
+        loan_copy['assumed_fields'] = assumed
+        marked_loans.append(loan_copy)
+    
+    return marked_loans
+
+
+def _calculate_loan_metrics(loan: dict) -> dict:
+    """
+    Calculate all financial metrics for a single loan scenario.
+    Also tracks which fields are "assumed" (user didn't provide them).
+    
+    Args:
+        loan: Dict with principal, rate, periods, monthly_payment, etc.
+        
+    Returns:
+        Dict with calculated metrics and 'assumed_fields' list
+    """
+    principal = loan.get('principal', 0) or 0
+    rate = loan.get('rate', 0) or 0
+    periods = int(loan.get('periods', 0) or 0)
+    monthly_payment = loan.get('monthly_payment', 0) or 0
+
+    # Track which fields are assumed (value is 0 or missing)
+    assumed_fields = []
+    if rate == 0:
+        assumed_fields.append('rate')
+    if principal <= 0:
+        assumed_fields.append('principal')
+    if monthly_payment <= 0:
+        assumed_fields.append('monthly_payment')
+
+    # If total_obligation provided, derive monthly_payment when possible
+    total_ob = loan.get('total_obligation', 0) or 0
+    if monthly_payment <= 0 and total_ob > 0 and periods > 0:
+        try:
+            monthly_payment = float(total_ob) / float(periods)
+            # monthly_payment derived from total_obligation; keep marked as assumed
+        except Exception:
+            pass
+
+    # If monthly_payment still missing but principal and periods are known, calculate using proper amortization
+    if monthly_payment <= 0 and principal > 0 and periods > 0:
+        if rate > 0:
+            # Calculate amortization payment using proper formula
+            monthly_rate = rate / 100 / 12
+            try:
+                monthly_payment = principal * (monthly_rate * (1 + monthly_rate) ** periods) / ((1 + monthly_rate) ** periods - 1)
+                # monthly_payment calculated from principal, rate, periods; keep marked as assumed
+            except Exception:
+                # Fallback if calculation fails
+                monthly_payment = principal / periods
+        else:
+            # Zero interest: simple division
+            monthly_payment = principal / periods
+
+    # Require at least some data to compute: periods must be >0 and one of principal/monthly/total must be present
+    if periods <= 0 or (principal <= 0 and monthly_payment <= 0 and total_ob <= 0):
+        return {
+            'principal': principal,
+            'total_interest': 0,
+            'total_paid': 0,
+            'future_value': 0,
+            'implied_rate': rate,
+            'amortization_sample': [],
+            'monthly_payment': monthly_payment,
+            'assumed_fields': assumed_fields,
+            'periods': periods
+        }
+    
+    # Calculate implied rate if rate was not provided
+    implied_rate = rate
+    if rate == 0 and monthly_payment > 0 and principal > 0:
+        calculated_rate = FinancialCalculator.calculate_implied_rate(
+            principal, monthly_payment, periods
+        )
+        if calculated_rate:
+            implied_rate = calculated_rate
+        else:
+            implied_rate = 0  # Fallback to 0 if calculation fails
+    
+    # Use implied rate for further calculations
+    calculation_rate = implied_rate if implied_rate > 0 else rate
+    
+    # Calculate total paid and total interest (robust to missing principal)
+    if monthly_payment > 0:
+        total_paid = monthly_payment * periods
+        if principal > 0:
+            total_interest = FinancialCalculator.calculate_total_interest(
+                principal, monthly_payment, periods
+            )
+        else:
+            # If principal unknown, assume total_interest = total_paid (will be flagged as assumed)
+            total_interest = total_paid - principal
+    else:
+        total_interest = 0
+        total_paid = principal
+    
+    # Calculate future value
+    future_value = FinancialCalculator.calculate_future_value(
+        principal, calculation_rate, periods, monthly_payment
+    )
+    
+    # Generate amortization schedule (first 3 and last 3 months for summary)
+    schedule = FinancialCalculator.generate_amortization_schedule(
+        principal, calculation_rate, periods, monthly_payment
+    )
+    
+    sample_schedule = (schedule[:3] if len(schedule) > 6 else schedule[:3]) + \
+                     (schedule[-3:] if len(schedule) > 6 else [])
+    
+    # Extract down_payment and residual_value from loan dict (these are informational only)
+    down_payment = loan.get('down_payment', 0) or 0
+    residual_value = loan.get('residual_value', 0) or 0
+    
+    # Calculate net cost: only total_paid (down_payment and residual_value are informational only)
+    net_cost = total_paid
+    
+    return {
+        'principal': principal,
+        'total_interest': total_interest,
+        'total_paid': total_paid,
+        'net_cost': net_cost,
+        'down_payment': down_payment,
+        'residual_value': residual_value,
+        'future_value': future_value,
+        'implied_rate': implied_rate,
+        'amortization_sample': sample_schedule,
+        'monthly_payment': monthly_payment if monthly_payment > 0 else principal / periods,
+        'assumed_fields': assumed_fields,
+        'periods': periods
+    }
+
+
+def _calculate_comparison_metrics(loans: list[dict], metric_type: str = 'total_interest') -> dict:
+    """
+    Compare multiple loans across a single metric.
+    
+    Args:
+        loans: List of loan dicts
+        metric_type: 'total_interest', 'total_paid', 'future_value', 'implied_rate', 'monthly_payment'
+        
+    Returns:
+        Dict with comparison results and ranking
+    """
+    results = []
+    
+    for idx, loan in enumerate(loans, 1):
+        metrics = _calculate_loan_metrics(loan)
+        metrics['name'] = loan.get('name', f'Opción {idx}')
+        metrics['index'] = idx
+        results.append(metrics)
+    
+    # Sort by selected metric
+    if metric_type == 'total_interest':
+        results_sorted = sorted(results, key=lambda x: x['total_interest'])
+        metric_label = 'Interés Total'
+    elif metric_type == 'total_paid':
+        results_sorted = sorted(results, key=lambda x: x['total_paid'])
+        metric_label = 'Costo Total'
+    elif metric_type == 'future_value':
+        results_sorted = sorted(results, key=lambda x: x['future_value'])
+        metric_label = 'Valor Futuro'
+    elif metric_type == 'implied_rate':
+        results_sorted = sorted(results, key=lambda x: x['implied_rate'])
+        metric_label = 'Tasa Implícita'
+    elif metric_type == 'monthly_payment':
+        results_sorted = sorted(results, key=lambda x: x['monthly_payment'])
+        metric_label = 'Cuota Mensual'
+    else:
+        results_sorted = results
+        metric_label = metric_type
+    
+    # Add ranking
+    for rank, result in enumerate(results_sorted, 1):
+        result['rank'] = rank
+    
+    return {
+        'metric_type': metric_type,
+        'metric_label': metric_label,
+        'results': results_sorted,
+        'best_option': results_sorted[0] if results_sorted else None
+    }
 
 
 def _generate_problem_narrative(question: str, solved: dict) -> dict:
@@ -611,33 +1272,29 @@ def _generate_problem_narrative(question: str, solved: dict) -> dict:
                 "costos totales e intereses pagados."
             )
 
-    system_prompt = """You are a financial analyst.
-Write a concise but human-readable report in Spanish with this structure:
-1) Interpretación del problema
-2) Supuestos y defaults utilizados
-3) Pasos de cálculo (claros)
-4) Resultado principal
-5) Interpretación ejecutiva
-6) Recomendaciones accionables
+    system_prompt = (
+        "You are a financial analyst.\n"
+        "Write a concise but human-readable report in Spanish with this structure:\n"
+        "1) Interpretación del problema\n"
+        "2) Supuestos y defaults utilizados\n"
+        "3) Pasos de cálculo (claros)\n"
+        "4) Resultado principal\n"
+        "5) Interpretación ejecutiva\n"
+        "6) Recomendaciones accionables\n\n"
+        "Strict rules:\n"
+        "- Mention that this is educational and not regulated investment advice.\n"
+        "- Do not recommend specific financial products without user profile context.\n"
+        "- Always reference ONLY the deterministic results provided in the input (the solver's trace).\n"
+        "- Do NOT invent or introduce any new numeric values. Use only numbers present in the solver output (`trace.result` or top-level `result`).\n"
+        "- If a deterministic main result is provided in the user prompt, include it verbatim in the section '4) Resultado principal'.\n"
+        "- If you cannot produce the narrative without adding or guessing numbers, return an error instead of fabricating values."
+    )
 
-Strict rules:
-- Mention that this is educational and not regulated investment advice.
-- Do not recommend specific financial products without user profile context.
-- Always reference ONLY the deterministic results provided in the input (the solver's trace).
-- Do NOT invent or introduce any new numeric values. Use only numbers present in the solver output (`trace.result` or top-level `result`).
-- If a deterministic main result is provided in the user prompt, include it verbatim in the section '4) Resultado principal'.
-- If you cannot produce the narrative without adding or guessing numbers, return an error instead of fabricating values.
-"""
-
-    user_prompt = f"""Original question:
-{question}
-
-Deterministic solution trace:
-{json.dumps(solved, ensure_ascii=False, indent=2)}
-
-Deterministic main result to include verbatim if available:
-{deterministic_summary}
-"""
+    user_prompt = (
+        f"Original question:\n{question}\n\n"
+        f"Deterministic solution trace:\n{json.dumps(solved, ensure_ascii=False, indent=2)}\n\n"
+        f"Deterministic main result to include verbatim if available:\n{deterministic_summary}"
+    )
 
     narrative = llm.make_call(user_prompt, system_prompt, expect_json=False)
     if not narrative:
@@ -751,12 +1408,22 @@ def _is_valid_structured_payload(payload: dict) -> tuple[bool, str]:
         if len(loans) < 2:
             return False, "Necesitas al menos dos préstamos para comparar."
         for index, loan in enumerate(loans, start=1):
-            if not has_positive_number(loan.get("principal")):
-                return False, f"El préstamo {index} necesita un principal mayor que cero."
-            if not has_positive_number(loan.get("rate")):
-                return False, f"El préstamo {index} necesita una tasa mayor que cero."
-            if not has_positive_number(loan.get("periods")):
+            principal_ok = has_positive_number(loan.get("principal"))
+            monthly_ok = has_positive_number(loan.get("monthly_payment"))
+            total_ok = has_positive_number(loan.get("total_obligation"))
+            periods_ok = has_positive_number(loan.get("periods"))
+
+            if not periods_ok:
                 return False, f"El préstamo {index} necesita un plazo mayor que cero."
+
+            # Require at least one of principal, monthly payment, or total obligation
+            if not (principal_ok or monthly_ok or total_ok):
+                return False, f"El préstamo {index} necesita un principal, una cuota mensual o una obligación total válida."
+
+            # Allow missing/zero rate if a monthly_payment or total_obligation is provided
+            if not has_positive_number(loan.get("rate")):
+                if not (monthly_ok or total_ok):
+                    return False, f"El préstamo {index} necesita una tasa mayor que cero o una cuota mensual/obligación total válida."
         return True, ""
 
     if ptype == "compare_asset_options":
@@ -880,7 +1547,8 @@ def _prime_structured_form_state(draft: dict):
 
     elif ptype == "compare_loans":
         loans = inputs.get("loans", []) or []
-        st.session_state["cl_loan_count"] = max(len(loans) + 1, 2)
+        # Use the exact number of parsed loans, but at least 2 rows in the UI
+        st.session_state["cl_loan_count"] = max(len(loans), 2)
         for index, loan in enumerate(loans, start=1):
             st.session_state[f"cl_name_{index}"] = loan.get("name", st.session_state.get(f"cl_name_{index}", f"Opción {index}"))
             st.session_state[f"cl_principal_{index}"] = loan.get("principal", st.session_state.get(f"cl_principal_{index}", 0.0))
@@ -888,6 +1556,12 @@ def _prime_structured_form_state(draft: dict):
             st.session_state[f"cl_periods_{index}"] = loan.get("periods", st.session_state.get(f"cl_periods_{index}", 0))
             st.session_state[f"cl_rate_type_{index}"] = loan.get("rate_type", st.session_state.get(f"cl_rate_type_{index}", "effective_annual"))
             st.session_state[f"cl_method_{index}"] = loan.get("method", st.session_state.get(f"cl_method_{index}", "french"))
+            st.session_state[f"cl_monthly_{index}"] = loan.get("monthly_payment", st.session_state.get(f"cl_monthly_{index}", 0.0))
+            st.session_state[f"cl_fees_{index}"] = loan.get("fees_capitalized", st.session_state.get(f"cl_fees_{index}", 0.0))
+            st.session_state[f"cl_total_{index}"] = loan.get("total_obligation", st.session_state.get(f"cl_total_{index}", 0.0))
+            # Populate informational fields if present so the UI boxes show values
+            st.session_state[f"cl_down_payment_{index}"] = float(loan.get("down_payment", st.session_state.get(f"cl_down_payment_{index}", 0.0)))
+            st.session_state[f"cl_residual_{index}"] = float(loan.get("residual_value", loan.get("residual", st.session_state.get(f"cl_residual_{index}", 0.0))))
 
     elif ptype == "compare_asset_options":
         options = inputs.get("options", []) or []
@@ -897,7 +1571,9 @@ def _prime_structured_form_state(draft: dict):
         st.session_state["cao_rate_type"] = inputs.get("rate_type", st.session_state.get("cao_rate_type", "effective_annual"))
         for index, option in enumerate(options, start=1):
             st.session_state[f"cao_name_{index}"] = option.get("name", st.session_state.get(f"cao_name_{index}", f"Opción {index}"))
-            st.session_state[f"cao_type_{index}"] = option.get("option_type", st.session_state.get(f"cao_type_{index}", "purchase"))
+            # Accept multiple possible keys for option type coming from parsers
+            opt_type = option.get("option_type") or option.get("type") or option.get("optionType") or st.session_state.get(f"cao_type_{index}", "purchase")
+            st.session_state[f"cao_type_{index}"] = opt_type
             st.session_state[f"cao_upfront_{index}"] = option.get("upfront_payment", st.session_state.get(f"cao_upfront_{index}", 0.0))
             st.session_state[f"cao_monthly_{index}"] = option.get("monthly_payment", st.session_state.get(f"cao_monthly_{index}", 0.0))
             st.session_state[f"cao_term_{index}"] = option.get("term_months", st.session_state.get(f"cao_term_{index}", 48))
@@ -938,22 +1614,25 @@ def _render_structured_problem_builder(currency: str):
     st.caption("Escribe el problema en lenguaje natural; el LLM llenará las cajas y luego tú solo revisas antes de autorizar.")
     
     # Add custom CSS for orange button
-    st.markdown("""
-        <style>
-            [data-testid="column"] button[kind="primary"] {
-                background-color: #FF9800 !important;
-                color: white !important;
-                padding: 12px 24px !important;
-                font-size: 16px !important;
-                font-weight: 600 !important;
-                border-radius: 8px !important;
-                height: 48px !important;
-            }
-            [data-testid="column"] button[kind="primary"]:hover {
-                background-color: #F57C00 !important;
-            }
-        </style>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        (
+            "<style>"
+            "[data-testid='column'] button[kind='primary'] {"
+            "background-color: #FF9800 !important;"
+            "color: white !important;"
+            "padding: 12px 24px !important;"
+            "font-size: 16px !important;"
+            "font-weight: 600 !important;"
+            "border-radius: 8px !important;"
+            "height: 48px !important;"
+            "}"
+            "[data-testid='column'] button[kind='primary']:hover {"
+            "background-color: #F57C00 !important;"
+            "}"
+            "</style>"
+        ),
+        unsafe_allow_html=True,
+    )
 
     structured_question = st.text_area(
         "Describe el problema en lenguaje natural",
@@ -979,7 +1658,15 @@ def _render_structured_problem_builder(currency: str):
                 with st.spinner("Traduciendo el problema a campos estructurados..."):
                     parsed = _interpret_problem_to_json(structured_question.strip(), currency)
                     draft = parsed["draft"]
-                    _prime_structured_form_state(draft)
+
+                    # Show the parsed draft for inspection and store it
+                    try:
+                        st.markdown("**JSON primado (revísalo):**")
+                        st.json(draft)
+                    except Exception:
+                        st.text("(No se pudo renderizar JSON)")
+
+                    st.session_state["last_parsed_draft"] = draft
                     st.session_state.problem_source_question = structured_question.strip()
                     st.session_state.problem_draft = draft
                     st.session_state.problem_draft_text = json.dumps(draft, ensure_ascii=False, indent=2)
@@ -989,10 +1676,41 @@ def _render_structured_problem_builder(currency: str):
                         "narrative_llm_calls": 0,
                         "narrative_cost": 0.0,
                     }
+
+                    parser_used = draft.get("_parser_used") if isinstance(draft, dict) else None
+
+                    # Only enforce the loan-count fallback for loan comparisons.
+                    if (draft.get("problem_type") or "").lower().strip() == "compare_loans":
+                        loans = (draft.get("inputs", {}) or {}).get("loans", []) if isinstance(draft, dict) else []
+
+                        def loan_has_data(l):
+                            try:
+                                p = (l.get("principal") or 0) > 0
+                                m = (l.get("monthly_payment") or 0) > 0
+                                t = (l.get("total_obligation") or 0) > 0
+                                per = (l.get("periods") or 0) > 0
+                                return per and (p or m or t)
+                            except Exception:
+                                return False
+
+                        valid_count = sum(1 for l in loans if loan_has_data(l))
+                        if valid_count < 2:
+                            # Try heuristics as a fallback and show what happened
+                            heur = _heuristic_parse_refinance(structured_question.strip(), currency)
+                            heur["_parser_used"] = "heuristic_fallback_ui"
+                            st.warning("Se utilizó un parser heurístico porque el draft inicial no contenía suficientes préstamos completos. Revisa los campos.")
+                            st.json(heur)
+                            draft = heur
+
+                    # Prime session from the final draft we choose
+                    _prime_structured_form_state(draft)
                     st.session_state.problem_solver_error = None
-                    st.success("Cajas llenas. Revisa los datos y autoriza el cálculo.")
+                    st.success(f"Cajas llenas con parser: {draft.get('_parser_used', parser_used)}. Revisa los datos y autoriza el cálculo.")
+                    # Force a rerun so widget values reflect session state priming
+                    st.rerun()
             except Exception as e:
                 st.session_state.problem_solver_error = str(e)
+                st.error(f"Error al interpretar: {str(e)}")
 
     problem_type = st.selectbox(
         "Tipo de cálculo",
@@ -1013,7 +1731,30 @@ def _render_structured_problem_builder(currency: str):
 
     # Special handling for compare_loans (outside form due to buttons)
     if problem_type == "compare_loans":
-        st.markdown("Define los préstamos que deseas comparar. Siempre habrá una caja vacía para agregar más.")
+        st.markdown("Define los préstamos que deseas comparar. Los campos en **color diferente** serán supuestos para cálculos.")
+        
+        # Add CSS for highlighting assumed fields (light yellow background)
+        st.markdown(
+            """
+            <style>
+            .assumed-field {
+                background-color: #FFFACD !important;
+                border: 2px solid #FFD700 !important;
+            }
+            .assumed-badge {
+                display: inline-block;
+                background-color: #FFD700;
+                color: #333;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-size: 11px;
+                font-weight: bold;
+                margin-left: 5px;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
         
         # Initialize loan count if needed
         if "cl_loan_count" not in st.session_state:
@@ -1033,15 +1774,42 @@ def _render_structured_problem_builder(currency: str):
         for idx in range(1, num_loans + 1):
             with st.expander(f"Préstamo {idx}", expanded=(idx <= 2)):
                 loan_col1, loan_col2, loan_col3 = st.columns(3)
+                # Determine which fields look assumed (zero or missing) to show badge
+                cur_principal = float(st.session_state.get(f"cl_principal_{idx}", 0.0) or 0.0)
+                cur_rate = float(st.session_state.get(f"cl_rate_{idx}", 0.0) or 0.0)
+                cur_periods = int(st.session_state.get(f"cl_periods_{idx}", 0) or 0)
+                cur_monthly = float(st.session_state.get(f"cl_monthly_{idx}", 0.0) or 0.0)
+                cur_fees = float(st.session_state.get(f"cl_fees_{idx}", 0.0) or 0.0)
+                cur_total = float(st.session_state.get(f"cl_total_{idx}", 0.0) or 0.0)
+
+                def badge_html(cond, text='supuesto'):
+                    return f" <span class='assumed-badge'>{text}</span>" if cond else ""
+
                 with loan_col1:
-                    name = st.text_input(f"Nombre {idx}", value=st.session_state.get(f"cl_name_{idx}", f"Opción {idx}"), key=f"cl_name_{idx}")
-                    principal = st.number_input(f"Principal {idx}", min_value=0.0, value=float(st.session_state.get(f"cl_principal_{idx}", 0.0)), step=1000.0, key=f"cl_principal_{idx}")
+                    st.markdown(f"**Nombre {idx}**")
+                    name = st.text_input("", value=st.session_state.get(f"cl_name_{idx}", f"Opción {idx}"), key=f"cl_name_{idx}")
+                    st.markdown(f"**Principal {idx}**{badge_html(cur_principal==0)}", unsafe_allow_html=True)
+                    principal = st.number_input("", min_value=0.0, value=cur_principal, step=1000.0, key=f"cl_principal_{idx}")
                 with loan_col2:
-                    rate = st.number_input(f"Tasa anual {idx}", min_value=0.0, value=float(st.session_state.get(f"cl_rate_{idx}", 0.0)), step=0.01, format="%.4f", key=f"cl_rate_{idx}")
-                    periods = st.number_input(f"Plazo {idx}", min_value=0, value=int(st.session_state.get(f"cl_periods_{idx}", 0)), step=1, key=f"cl_periods_{idx}")
+                    st.markdown(f"**Tasa anual {idx}**{badge_html(cur_rate==0)}", unsafe_allow_html=True)
+                    rate = st.number_input("", min_value=0.0, value=cur_rate, step=0.01, format="%.4f", key=f"cl_rate_{idx}")
+                    st.markdown(f"**Plazo (meses) {idx}**{badge_html(cur_periods==0)}", unsafe_allow_html=True)
+                    periods = st.number_input("", min_value=0, value=cur_periods, step=1, key=f"cl_periods_{idx}")
+                    st.markdown(f"**Cuota mensual {idx} (opcional)**{badge_html(cur_monthly==0)}", unsafe_allow_html=True)
+                    monthly_payment = st.number_input("", min_value=0.0, value=cur_monthly, step=1.0, key=f"cl_monthly_{idx}")
                 with loan_col3:
-                    rate_type = st.selectbox(f"Tipo de tasa {idx}", ["effective_annual", "nominal_annual", "effective_monthly"], index=0, key=f"cl_rate_type_{idx}")
-                    method = st.selectbox(f"Método {idx}", ["french", "german", "american"], index=0, key=f"cl_method_{idx}")
+                    st.markdown(f"**Tipo de tasa {idx}**")
+                    rate_type = st.selectbox("", ["effective_annual", "nominal_annual", "effective_monthly"], index=0, key=f"cl_rate_type_{idx}")
+                    st.markdown(f"**Método {idx}**")
+                    method = st.selectbox("", ["french", "german", "american"], index=0, key=f"cl_method_{idx}")
+                    st.markdown(f"**Cargos / honorarios {idx}**{badge_html(cur_fees==0)}", unsafe_allow_html=True)
+                    fees_capitalized = st.number_input("", min_value=0.0, value=cur_fees, step=1.0, key=f"cl_fees_{idx}")
+                    st.markdown(f"**Obligación total {idx}**{badge_html(cur_total==0)}", unsafe_allow_html=True)
+                    total_obligation = st.number_input("", min_value=0.0, value=cur_total, step=1.0, key=f"cl_total_{idx}")
+                    st.markdown(f"**Pago Inicial (Pie) {idx}**")
+                    down_payment = st.number_input("", min_value=0.0, value=float(st.session_state.get(f"cl_down_payment_{idx}", 0.0)), step=1.0, key=f"cl_down_payment_{idx}")
+                    st.markdown(f"**Valor Residual {idx}**")
+                    residual_value = st.number_input("", min_value=0.0, value=float(st.session_state.get(f"cl_residual_{idx}", 0.0)), step=1.0, key=f"cl_residual_{idx}")
                 
                 loans.append({
                     "name": name,
@@ -1049,41 +1817,300 @@ def _render_structured_problem_builder(currency: str):
                     "rate": rate,
                     "rate_type": rate_type,
                     "periods": periods,
+                    "monthly_payment": monthly_payment,
+                    "fees_capitalized": fees_capitalized,
+                    "total_obligation": total_obligation,
+                    "down_payment": down_payment,
+                    "residual_value": residual_value,
                     "method": method,
                 })
         
-        # Quick comparison button and results
+        # Calculation and comparison section
         st.divider()
-        if st.button("📊 Calcular comparación rápida", type="secondary", use_container_width=True, key="cl_calc_btn"):
-            # Allow 0% rate; just check principal and periods
-            valid_loans = [l for l in loans if l["principal"] > 0 and l["periods"] > 0 and l["rate"] is not None]
-            if len(valid_loans) >= 2:
-                comparison_result = _calculate_quick_loan_comparison(loans)
-                if comparison_result.get("results"):
-                    st.subheader("📊 Resultados de comparación")
-                    
-                    # Table view
-                    df_comparison = pd.DataFrame([
-                        {
-                            "🏆": "🥇" if r["rank"] == 1 else "🥈" if r["rank"] == 2 else "🥉",
-                            "Opción": r["name"],
-                            "Principal": f"${r['principal']:,.2f}",
-                            "Tasa": f"{r['rate']*100:.2f}%",
-                            "Plazo": f"{r['periods']} meses",
-                            "Cuota": f"${r['estimated_payment']:,.2f}",
-                            "Total Pagado": f"${r['total_paid']:,.2f}",
-                            "Intereses": f"${r['total_interest']:,.2f}",
+        st.subheader("📊 Análisis y Comparación")
+        
+        # Select comparison metric
+    # If the parser primed a compare_asset_options draft, offer actions to the user
+    pd = st.session_state.get("problem_draft", {}) or {}
+    if pd.get("problem_type") == "compare_asset_options":
+        st.markdown("---")
+        st.info("He detectado una comparación de opciones (compra / leasing / renta). ¿Qué quieres hacer?")
+        action = st.radio("Selecciona acción:", ["Revisar/Editar todas las opciones", "Analizar una opción individual (copiar a comparación de préstamos)"], index=0)
+        cao_count = st.session_state.get("cao_option_count", 0)
+        if action != "Revisar/Editar todas las opciones":
+            # let the user pick which option to analyze
+            names = [st.session_state.get(f"cao_name_{i}", f"Opción {i}") for i in range(1, cao_count+1)] or ["Opción 1"]
+            pick = st.selectbox("Elige la opción a analizar:", names, index=0)
+            if st.button("Copiar opción seleccionada a 'Comparar préstamos'"):
+                # find index
+                idx = names.index(pick) + 1
+                # build a minimal compare_loans draft with the selected option as first loan
+                loan = {
+                    "name": st.session_state.get(f"cao_name_{idx}", pick),
+                    "principal": st.session_state.get(f"cao_upfront_{idx}", 0.0),
+                    "rate": 0.0,
+                    "rate_type": st.session_state.get("cao_rate_type", "effective_annual"),
+                    "periods": int(st.session_state.get(f"cao_term_{idx}", 0) or 0),
+                    "monthly_payment": float(st.session_state.get(f"cao_monthly_{idx}", 0.0) or 0.0),
+                    "fees_capitalized": 0.0,
+                    "total_obligation": 0.0,
+                    "method": "french",
+                    "down_payment": float(st.session_state.get(f"cao_upfront_{idx}", 0.0) or 0.0),
+                    "residual_value": float(st.session_state.get(f"cao_residual_{idx}", 0.0) or 0.0),
+                }
+                draft = {
+                    "problem_type": "compare_loans",
+                    "currency": pd.get("currency", "USD"),
+                    "inputs": {"loans": [loan]}
+                }
+                # prime the structured form state with this draft
+                _prime_structured_form_state(draft)
+                st.success("Opción copiada a 'Comparar préstamos'. Ve al modo 'Comparar préstamos' para completar y analizar.")
+                st.experimental_rerun()
+        metric_choice = st.selectbox(
+            "¿Qué métrica quieres comparar?",
+            ["total_interest", "total_paid", "implied_rate", "monthly_payment"],
+            format_func=lambda x: {
+                "total_interest": "💰 Interés Total Pagado",
+                "total_paid": "💸 Costo Total (Principal + Interés)",
+                "implied_rate": "📈 Tasa Implícita Anual",
+                "monthly_payment": "📅 Cuota Mensual"
+            }.get(x, x),
+            key="cl_metric_choice"
+        )
+        
+        # Calculate comparison
+        calculate_clicked = st.button(
+            "🧮 Calcular y Comparar",
+            type="primary",
+            use_container_width=True,
+            key="cl_calc_btn"
+        )
+        
+        if calculate_clicked:
+            # First, try to fill missing periods using other loans or a sane default
+            # Ensure `loans` is defined (may be absent if not in compare_loans mode)
+            if 'loans' not in locals():
+                loans = []
+
+            detected_periods = [int(l.get("periods") or 0) for l in loans if (l.get("periods") or 0) > 0]
+            default_period = detected_periods[0] if detected_periods else 63
+
+            for l in loans:
+                # If periods missing but total_obligation present, set to default_period
+                if not (l.get("periods") or 0) and (l.get("total_obligation") or 0) > 0:
+                    l["periods"] = default_period
+
+            # Now derive monthly payments when possible (total_obligation / periods)
+            for l in loans:
+                if not (l.get("monthly_payment") or 0) and (l.get("total_obligation") or 0) > 0 and (l.get("periods") or 0) > 0:
+                    try:
+                        l["monthly_payment"] = float(l.get("total_obligation", 0)) / float(l.get("periods", 1))
+                    except Exception:
+                        l["monthly_payment"] = 0
+
+            # Build valid_loans using relaxed rules: accept loans with periods>0 and at least one of principal/monthly/total_obligation
+            valid_loans = []
+            for l in loans:
+                periods_ok = (l.get("periods") or 0) > 0
+                principal_ok = (l.get("principal") or 0) > 0
+                monthly_ok = (l.get("monthly_payment") or 0) > 0
+                total_ok = (l.get("total_obligation") or 0) > 0
+
+                if periods_ok and (principal_ok or monthly_ok or total_ok):
+                    valid_loans.append(l)
+
+            if len(valid_loans) < 2:
+                # If we have asset options available, offer to import them as loans
+                cao_count = st.session_state.get("cao_option_count", 0)
+                pd = st.session_state.get("problem_draft", {}) or {}
+                # If this is actually an asset comparison, auto-convert the options instead of blocking.
+                if pd.get("problem_type") == "compare_asset_options" and cao_count and cao_count > 0:
+                    loans_from_cao = []
+                    for i in range(1, cao_count + 1):
+                        upfront = float(st.session_state.get(f"cao_upfront_{i}", 0.0) or 0.0)
+                        monthly = float(st.session_state.get(f"cao_monthly_{i}", 0.0) or 0.0)
+                        term = int(st.session_state.get(f"cao_term_{i}", 0) or 0)
+                        residual = float(st.session_state.get(f"cao_residual_{i}", 0.0) or 0.0)
+                        lease_buy_price = float(st.session_state.get(f"cao_lease_buy_price_{i}", 0.0) or 0.0)
+                        principal = upfront if upfront > 0 else (lease_buy_price if lease_buy_price > 0 else 0.0)
+                        total_obligation = float(monthly) * int(term) if monthly > 0 and term > 0 else 0.0
+                        loans_from_cao.append({
+                            "name": st.session_state.get(f"cao_name_{i}", f"Opción {i}"),
+                            "principal": principal,
+                            "rate": 0.0,
+                            "rate_type": st.session_state.get("cao_rate_type", "effective_annual"),
+                            "periods": term,
+                            "monthly_payment": monthly,
+                            "fees_capitalized": 0.0,
+                            "total_obligation": total_obligation,
+                            "down_payment": upfront,
+                            "residual_value": residual,
+                            "method": "french",
+                        })
+
+                    loans = loans_from_cao
+                    valid_loans = []
+                    for l in loans:
+                        periods_ok = (l.get("periods") or 0) > 0
+                        principal_ok = (l.get("principal") or 0) > 0
+                        monthly_ok = (l.get("monthly_payment") or 0) > 0
+                        total_ok = (l.get("total_obligation") or 0) > 0
+                        if periods_ok and (principal_ok or monthly_ok or total_ok):
+                            valid_loans.append(l)
+                    st.info("Se importaron automáticamente las opciones de compra/leasing/renta para poder compararlas como flujo de caja.")
+                elif cao_count and cao_count > 0:
+                    st.info("No hay suficientes préstamos completos. Puedes importar las opciones (compra/leasing/renta) como préstamos para analizarlas aquí.")
+                    if st.button("Importar opciones como préstamos", key="import_cao_to_loans"):
+                        loans_from_cao = []
+                        for i in range(1, cao_count + 1):
+                            upfront = float(st.session_state.get(f"cao_upfront_{i}", 0.0) or 0.0)
+                            monthly = float(st.session_state.get(f"cao_monthly_{i}", 0.0) or 0.0)
+                            term = int(st.session_state.get(f"cao_term_{i}", 0) or 0)
+                            residual = float(st.session_state.get(f"cao_residual_{i}", 0.0) or 0.0)
+                            lease_buy_price = float(st.session_state.get(f"cao_lease_buy_price_{i}", 0.0) or 0.0)
+                            principal = upfront if upfront > 0 else (lease_buy_price if lease_buy_price > 0 else 0.0)
+                            total_obligation = float(monthly) * int(term) if monthly > 0 and term > 0 else 0.0
+                            loan = {
+                                "name": st.session_state.get(f"cao_name_{i}", f"Opción {i}"),
+                                "principal": principal,
+                                "rate": 0.0,
+                                "rate_type": st.session_state.get("cao_rate_type", pd.get("currency", "effective_annual")),
+                                "periods": term,
+                                "monthly_payment": monthly,
+                                "fees_capitalized": 0.0,
+                                "total_obligation": total_obligation,
+                                "down_payment": upfront,
+                                "residual_value": residual,
+                                "method": "french",
+                            }
+                            loans_from_cao.append(loan)
+
+                        draft = {
+                            "problem_type": "compare_loans",
+                            "currency": pd.get("currency", "USD"),
+                            "inputs": {"loans": loans_from_cao},
                         }
-                        for r in comparison_result["results"]
-                    ])
-                    st.dataframe(df_comparison, use_container_width=True, hide_index=True)
-                    
-                    # Winner info
-                    winner = comparison_result["results"][0] if comparison_result["results"] else None
-                    if winner:
-                        st.success(f"✅ **Mejor opción:** {winner['name']} con pago total de ${winner['total_paid']:,.2f}")
+                        _prime_structured_form_state(draft)
+                        st.success("Opciones importadas como préstamos. Revisa las cajas y vuelve a calcular.")
+                        st.experimental_rerun()
+                else:
+                    st.warning("⚠️ Necesitas al menos 2 préstamos con datos suficientes (plazo>0 y principal/cuota/obligación).")
             else:
-                st.warning("Necesitas al menos 2 préstamos completamente llenos (principal, plazo > 0; tasa >= 0).")
+                with st.spinner("Calculando métricas..."):
+                    # Calculate all metrics
+                    comparison = _calculate_comparison_metrics(valid_loans, metric_choice)
+                    
+                    # Display results
+                    st.success(f"✅ Comparación por: **{comparison['metric_label']}**")
+                    
+                    # Show best option with proper formatting per metric
+                    best = comparison['best_option']
+                    if best:
+                        # Format metric value according to metric type
+                        if metric_choice in ("total_interest", "total_paid", "future_value"):
+                            metric_value = f"${best.get(metric_choice, 0):,.2f}"
+                        elif metric_choice == "implied_rate":
+                            metric_value = f"{best.get(metric_choice, 0):.2f}%"
+                        elif metric_choice == "monthly_payment":
+                            metric_value = f"${best.get(metric_choice, 0):,.2f}/mes"
+                        else:
+                            metric_value = str(best.get(metric_choice, "N/A"))
+
+                        st.info(
+                            f"🏆 **Mejor opción:** {best['name']}\n\n"
+                            f"• {comparison['metric_label']}: **{metric_value}**"
+                        )
+                    
+                    # Detailed table
+                    st.markdown("#### Desglose Completo")
+                    st.caption("🔍 **Campos en amarillo = Valores asumidos por defecto (no proporcionados por el usuario)**")
+                    
+                    # Build results with visual markers
+                    results_df = []
+                    for result in comparison['results']:
+                        # Check if rate is assumed (was 0)
+                        is_rate_assumed = 'rate' in result.get('assumed_fields', [])
+                        
+                        # Format rate with marker if assumed
+                        rate_str = f"{result['implied_rate']:.3f}%"
+                        if is_rate_assumed and result['implied_rate'] == 0:
+                            rate_str = f"⚠️ {rate_str} (supuesto)"
+                        
+                        results_df.append({
+                            "🏆": "🥇" if result['rank'] == 1 else "🥈" if result['rank'] == 2 else "🥉",
+                            "Opción": result['name'],
+                            "Principal": f"${result['principal']:,.2f}",
+                            "Tasa Implícita": rate_str,
+                            "Cuota Mensual": f"${result['monthly_payment']:,.2f}",
+                            "Interés Total": f"${result['total_interest']:,.2f}",
+                            "Costo Total": f"${result['total_paid']:,.2f}",
+                        })
+                    
+                    # Render HTML table so assumed fields can be highlighted
+                    html = "<style>.assumed-field{background:#FFFACD;padding:6px;border-radius:4px;} .results-table th{background:#f8f8f8;padding:8px;text-align:left;} .results-table td{padding:8px;border-bottom:1px solid #eee;} .info-note{font-size:0.85em;color:#666;font-style:italic;margin:8px 0;}</style>"
+                    html += "<p class='info-note'><strong>Nota:</strong> Pago Inicial y Valor Residual son campos informativos y no afectan el cálculo del Costo Neto.</p>"
+                    html += "<table class='results-table' style='width:100%; border-collapse: collapse;'>"
+                    html += "<thead><tr>"
+                    headers = ["","Opción","Pago Inicial*","Principal","Tasa Implícita","Cuota Mensual","Interés Total","Costo Total","Valor Residual*","Costo Neto"]
+                    for h in headers:
+                        html += f"<th>{h}</th>"
+                    html += "</tr></thead><tbody>"
+                    for r in comparison['results']:
+                        assumed = set(r.get('assumed_fields', []))
+                        html += "<tr>"
+                        html += f"<td>{'🥇' if r['rank']==1 else '🥈' if r['rank']==2 else '🥉'}</td>"
+                        html += f"<td>{r['name']}</td>"
+                        html += f"<td>${r.get('down_payment',0):,.2f}</td>"
+                        cls = 'assumed-field' if r.get('principal',0)==0 or 'principal' in assumed else ''
+                        html += f"<td class='{cls}'>${r.get('principal',0):,.2f}</td>"
+                        cls = 'assumed-field' if 'rate' in assumed or r.get('implied_rate',0)==0 else ''
+                        html += f"<td class='{cls}'>{r.get('implied_rate',0):.3f}%</td>"
+                        cls = 'assumed-field' if 'monthly_payment' in assumed or r.get('monthly_payment',0)==0 else ''
+                        html += f"<td class='{cls}'>${r.get('monthly_payment',0):,.2f}</td>"
+                        cls = 'assumed-field' if 'total_interest' in assumed else ''
+                        html += f"<td class='{cls}'>${r.get('total_interest',0):,.2f}</td>"
+                        cls = 'assumed-field' if 'total_paid' in assumed else ''
+                        html += f"<td class='{cls}'>${r.get('total_paid',0):,.2f}</td>"
+                        html += f"<td>${r.get('residual_value',0):,.2f}</td>"
+                        html += f"<td><strong>${r.get('net_cost',0):,.2f}</strong></td>"
+                        html += "</tr>"
+                    html += "</tbody></table>"
+                    st.markdown(html, unsafe_allow_html=True)
+                    
+                    # Show individual metrics for each loan
+                    st.markdown("#### Detalles por Opción")
+                    for result in comparison['results']:
+                        is_rate_assumed = 'rate' in result.get('assumed_fields', [])
+                        
+                        with st.expander(f"{result['name']} (#{result['rank']})"):
+                            metric_cols = st.columns(4)
+                            with metric_cols[0]:
+                                st.metric("Principal", f"${result['principal']:,.2f}")
+                            with metric_cols[1]:
+                                rate_label = "Tasa Implícita ⚠️" if (is_rate_assumed and result['implied_rate'] == 0) else "Tasa Implícita"
+                                st.metric(rate_label, f"{result['implied_rate']:.3f}%")
+                                if is_rate_assumed and result['implied_rate'] == 0:
+                                    st.caption("(Supuesto: Los bancos normalmente cobran interés > 0%)")
+                            with metric_cols[2]:
+                                st.metric("Cuota Mensual", f"${result['monthly_payment']:,.2f}")
+                            with metric_cols[3]:
+                                st.metric("Plazo", f"{result.get('periods', 'N/A')} meses")
+                            
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.metric("Interés Total", f"${result['total_interest']:,.2f}")
+                            with col2:
+                                st.metric("Costo Total", f"${result['total_paid']:,.2f}")
+                            
+                            # Show warnings for assumed rate = 0
+                            if is_rate_assumed and result['implied_rate'] == 0:
+                                st.warning(
+                                    "⚠️ **Esta tasa es un supuesto del sistema.**\n\n"
+                                    "Los bancos rara vez prestan dinero al 0%. Si deseas precisión, "
+                                    "proporciona la tasa real en el formulario de entrada."
+                                )
+        
         st.divider()
         
         # For compare_loans, just show results - no need for JSON editor or solver
@@ -1359,6 +2386,10 @@ def render_problem_solver_page():
     st.header("🧮 Problemas cotidianos")
     st.caption("Resuelve preguntas financieras en lenguaje natural con cálculo determinístico en Python y redacción ejecutiva asistida por LLM.")
 
+    pending_mode = st.session_state.pop("problem_solver_pending_input_mode", None)
+    if pending_mode:
+        st.session_state["problem_solver_input_mode"] = pending_mode
+
     input_mode = st.radio(
         "Modo de entrada",
         ["Formulario estructurado", "Texto libre asistido"],
@@ -1382,6 +2413,28 @@ def render_problem_solver_page():
     with col3:
         st.text_input("Base de días", value="365", disabled=True)
 
+    asset_preview = None
+    if input_mode == "Texto libre asistido" and question.strip():
+        if re.search(r"\b(compra|leasing|lease|renta|arrend|arriendo|primera\s+opci[oó]n|segunda\s+opci[oó]n|tercera\s+opci[oó]n)\b", question.lower()):
+            asset_preview = _heuristic_parse_asset_options(question.strip(), currency)
+            st.markdown("#### Vista previa interpretada")
+            st.json(asset_preview)
+            st.caption("Esta vista previa se genera localmente para comparaciones de compra / leasing / renta.")
+            if st.button("Cargar esta interpretación en el formulario estructurado", key="load_asset_preview_to_structured"):
+                st.session_state.problem_source_question = question.strip()
+                st.session_state.problem_draft = asset_preview
+                st.session_state.problem_draft_text = json.dumps(asset_preview, ensure_ascii=False, indent=2)
+                st.session_state.problem_solver_error = None
+                st.session_state.problem_solver_metrics = {
+                    "parse_llm_calls": 0,
+                    "parse_cost": 0.0,
+                    "narrative_llm_calls": 0,
+                    "narrative_cost": 0.0,
+                }
+                _prime_structured_form_state(asset_preview)
+                st.session_state["problem_solver_pending_input_mode"] = "Formulario estructurado"
+                st.rerun()
+
     if input_mode == "Texto libre asistido":
         if st.button("🧠 Interpretar problema", type="secondary", use_container_width=True):
             if not question.strip():
@@ -1390,9 +2443,10 @@ def render_problem_solver_page():
                 try:
                     with st.spinner("Interpretando y ordenando datos..."):
                         parsed = _interpret_problem_to_json(question.strip(), currency)
+                        parsed_draft = _normalize_draft_for_compare_loans(parsed.get("draft", {}))
                         st.session_state.problem_source_question = question.strip()
-                        st.session_state.problem_draft = parsed["draft"]
-                        st.session_state.problem_draft_text = json.dumps(parsed["draft"], ensure_ascii=False, indent=2)
+                        st.session_state.problem_draft = parsed_draft
+                        st.session_state.problem_draft_text = json.dumps(parsed_draft, ensure_ascii=False, indent=2)
                         st.session_state.problem_solver_metrics = {
                             "parse_llm_calls": parsed["metrics"]["llm_calls"],
                             "parse_cost": parsed["metrics"]["estimated_cost"],
@@ -1400,9 +2454,21 @@ def render_problem_solver_page():
                             "narrative_cost": 0.0,
                         }
                         st.session_state.problem_solver_error = None
+                        _prime_structured_form_state(parsed_draft)
+                        # After parsing, switch to the structured view so the primed fields are visible.
+                        st.session_state["problem_solver_pending_input_mode"] = "Formulario estructurado"
+                        st.rerun()
                 except Exception as e:
                     st.session_state.problem_solver_error = str(e)
     else:
+        if st.session_state.get("problem_draft"):
+            st.markdown("#### Interpretación actual")
+            try:
+                st.json(st.session_state.get("problem_draft"))
+            except Exception:
+                st.text(st.session_state.get("problem_draft_text", ""))
+            if st.session_state.get("problem_draft", {}).get("problem_type") == "compare_asset_options":
+                st.info("Este caso ya fue identificado como comparación de compra / leasing / renta. Cambia a 'Formulario estructurado' para revisar y comparar las opciones en cajas.")
         structured_payload = _render_structured_problem_builder(currency)
         if structured_payload:
             st.session_state.problem_source_question = "Formulario estructurado"
@@ -1415,60 +2481,6 @@ def render_problem_solver_page():
                 "narrative_cost": 0.0,
             }
             st.session_state.problem_solver_error = None
-
-    if st.session_state.get("problem_draft_text"):
-        draft_dict = st.session_state.get("problem_draft", {})
-        defaults_used = draft_dict.get("defaults_used", [])
-        
-        if defaults_used:
-            defaults_markdown = "".join([
-                f"<li style='margin-bottom: 8px;'><span style='color:#b00020; font-weight:700;'>{d}</span></li>"
-                for d in defaults_used
-            ])
-            st.markdown(
-                f"""
-                <div style="background-color: #fff0f0; border: 2px solid #d32f2f; color: #b00020; padding: 16px; border-radius: 8px; margin-bottom: 15px;">
-                    <strong style="font-size: 1.05rem;">⚠️ ATENCIÓN - DATOS ASUMIDOS AUTOMÁTICAMENTE:</strong><br>
-                    <span style="font-weight: 700;">El problema no contenía toda la información necesaria.</span>
-                    Se inyectaron estos supuestos para poder calcular. Revisa cada uno y modifícalo si deseas trabajar con otro valor:<br><br>
-                    <ul style="margin-top: 8px; margin-bottom: 0; padding-left: 22px;">
-                        {defaults_markdown}
-                    </ul>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-
-    if st.session_state.get("problem_solver_error"):
-        st.error(f"Error en resolución: {st.session_state.problem_solver_error}")
-
-    solved = st.session_state.get("problem_solver_result")
-    if solved:
-        metrics = st.session_state.get("problem_solver_metrics", {})
-
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            st.metric("LLM interpretación", metrics.get("parse_llm_calls", 0), f"${metrics.get('parse_cost', 0.0):.4f}")
-        with m2:
-            st.metric("LLM redacción", metrics.get("narrative_llm_calls", 0), f"${metrics.get('narrative_cost', 0.0):.4f}")
-        with m3:
-            st.metric("Costo total etapa", f"{metrics.get('total_llm_calls', 0)} calls", f"${metrics.get('total_cost', 0.0):.4f}")
-
-        st.subheader("🧾 Trazabilidad")
-        st.json(
-            {
-                "inputs": solved.get("trace", {}).get("inputs", {}),
-                "assumptions": solved.get("trace", {}).get("assumptions", []),
-                "formula": solved.get("trace", {}).get("formula", ""),
-                "result": solved.get("trace", {}).get("result", {}),
-                "timestamp": solved.get("timestamp"),
-            }
-        )
-
-        st.subheader("📄 Respuesta ejecutiva")
-        st.markdown(st.session_state.get("problem_solver_narrative", ""))
-        st.caption("Supuestos y defaults usados están documentados en la trazabilidad superior.")
 
 
 def _generate_executive_summary(result: dict, income: float, expenses: float, savings: float, savings_rate: float, health_status: str) -> str:
@@ -2334,6 +3346,7 @@ def show_debug_diagnostics(result: dict):
             st.write("**Detected transaction-like lines (sample)**")
             for line in lines:
                 st.code(line)
+
 
 if __name__ == "__main__":
     main()

@@ -160,6 +160,70 @@ def amortization_american(principal: float, periodic_rate: float, periods: int) 
     return schedule, total_paid
 
 
+def implied_rate_from_payment(principal: float, payment: float, periods: int, method: str = "french", tol: float = 1e-9, max_iter: int = 200) -> Dict:
+    """Solve for periodic rate r such that the amortization payment equals the provided payment.
+
+    Returns a dict with `periodic_rate`, `effective_annual` and `nominal_annual`.
+    Uses bisection to guarantee convergence and robustness for typical consumer rates.
+    """
+    p = _safe_float(principal)
+    target = _safe_float(payment)
+    n = int(periods)
+
+    if n <= 0:
+        raise ValueError("periods must be > 0")
+    if target <= 0:
+        raise ValueError("payment must be > 0")
+
+    def payment_for_r(r):
+        if method == "french":
+            pay, _ = amortization_french(p, r, n)
+            return pay
+        elif method == "german":
+            schedule, _ = amortization_german(p, r, n)
+            return schedule[0]["payment"] if schedule else 0.0
+        else:
+            schedule, _ = amortization_american(p, r, n)
+            return schedule[0]["payment"] if schedule else 0.0
+
+    # bracket search: start from near-zero up to a large rate
+    low = 0.0
+    high = 1.0
+
+    # expand upper bound until signs differ or we reach very large rate
+    for _ in range(80):
+        f_low = payment_for_r(low) - target
+        f_high = payment_for_r(high) - target
+        if f_low == 0:
+            r = low
+            break
+        if f_low * f_high < 0:
+            break
+        high *= 2.0
+    else:
+        # fallback: if we couldn't bracket, try a safe guess
+        r = 0.0
+
+    # If r wasn't set in the bracket loop, perform bisection
+    if 'r' not in locals():
+        for i in range(max_iter):
+            mid = (low + high) / 2.0
+            f_mid = payment_for_r(mid) - target
+            if abs(f_mid) < tol:
+                r = mid
+                break
+            if (payment_for_r(low) - target) * f_mid < 0:
+                high = mid
+            else:
+                low = mid
+        else:
+            r = mid
+
+    effective_annual = (1 + r) ** 12 - 1
+    nominal_annual = r * 12
+    return {"periodic_rate": r, "effective_annual": effective_annual, "nominal_annual": nominal_annual}
+
+
 def loan_payment(problem: Dict) -> Dict:
     principal = _safe_float(problem.get("principal"))
     periods = int(problem.get("periods", 0))
@@ -167,7 +231,34 @@ def loan_payment(problem: Dict) -> Dict:
     rate_type = problem.get("rate_type", "effective_annual")
     method = (problem.get("method", "french") or "french").lower()
 
-    r = _convert_rate_to_period(rate_value, rate_type)
+    # If rate is missing but a monthly payment or total obligation is provided,
+    # attempt to infer the implicit periodic rate that matches the payment.
+    monthly_payment_input = problem.get("monthly_payment")
+    total_obligation = problem.get("total_obligation")
+
+    if rate_value in [None, "", 0, "0"] and (monthly_payment_input or total_obligation):
+        # Determine an indicative monthly payment
+        if monthly_payment_input not in [None, "", 0, "0"]:
+            payment = _safe_float(monthly_payment_input)
+        else:
+            # If total_obligation provided, assume equal installments
+            periods_for_calc = periods if periods > 0 else int(problem.get("periods", 0))
+            payment = _safe_float(total_obligation) / periods_for_calc if periods_for_calc > 0 else 0.0
+
+        try:
+            implied = None
+            # lazy import of helper function (defined below)
+            implied = implied_rate_from_payment(principal, payment, periods, method=method)
+            # implied contains periodic_rate and annualized rates
+            r = implied.get("periodic_rate", 0.0)
+            # set a sensible rate_value (effective annual) so other code has it
+            rate_value = implied.get("effective_annual", 0.0)
+            rate_type = "effective_annual"
+        except Exception:
+            # fallback to normal conversion when inference fails
+            r = _convert_rate_to_period(rate_value, rate_type)
+    else:
+        r = _convert_rate_to_period(rate_value, rate_type)
 
     if method == "french":
         payment, schedule = amortization_french(principal, r, periods)
