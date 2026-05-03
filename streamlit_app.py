@@ -1712,10 +1712,15 @@ def _render_structured_problem_builder(currency: str):
                 st.session_state.problem_solver_error = str(e)
                 st.error(f"Error al interpretar: {str(e)}")
 
+    options_list = ["loan_payment", "compare_loans", "compare_asset_options", "present_value", "future_value", "rate_conversion", "npv_irr", "real_return"]
+    # Calculate the correct index based on session state
+    current_problem_type = st.session_state.get("structured_problem_type", "loan_payment")
+    current_index = options_list.index(current_problem_type) if current_problem_type in options_list else 0
+    
     problem_type = st.selectbox(
         "Tipo de cálculo",
-        ["loan_payment", "compare_loans", "compare_asset_options", "present_value", "future_value", "rate_conversion", "npv_irr", "real_return"],
-        index=0,
+        options_list,
+        index=current_index,
         format_func=lambda x: {
             "loan_payment": "Pago de préstamo",
             "compare_loans": "Comparar préstamos",
@@ -1829,44 +1834,7 @@ def _render_structured_problem_builder(currency: str):
         st.divider()
         st.subheader("📊 Análisis y Comparación")
         
-        # Select comparison metric
-    # If the parser primed a compare_asset_options draft, offer actions to the user
-    pd = st.session_state.get("problem_draft", {}) or {}
-    if pd.get("problem_type") == "compare_asset_options":
-        st.markdown("---")
-        st.info("He detectado una comparación de opciones (compra / leasing / renta). ¿Qué quieres hacer?")
-        action = st.radio("Selecciona acción:", ["Revisar/Editar todas las opciones", "Analizar una opción individual (copiar a comparación de préstamos)"], index=0)
-        cao_count = st.session_state.get("cao_option_count", 0)
-        if action != "Revisar/Editar todas las opciones":
-            # let the user pick which option to analyze
-            names = [st.session_state.get(f"cao_name_{i}", f"Opción {i}") for i in range(1, cao_count+1)] or ["Opción 1"]
-            pick = st.selectbox("Elige la opción a analizar:", names, index=0)
-            if st.button("Copiar opción seleccionada a 'Comparar préstamos'"):
-                # find index
-                idx = names.index(pick) + 1
-                # build a minimal compare_loans draft with the selected option as first loan
-                loan = {
-                    "name": st.session_state.get(f"cao_name_{idx}", pick),
-                    "principal": st.session_state.get(f"cao_upfront_{idx}", 0.0),
-                    "rate": 0.0,
-                    "rate_type": st.session_state.get("cao_rate_type", "effective_annual"),
-                    "periods": int(st.session_state.get(f"cao_term_{idx}", 0) or 0),
-                    "monthly_payment": float(st.session_state.get(f"cao_monthly_{idx}", 0.0) or 0.0),
-                    "fees_capitalized": 0.0,
-                    "total_obligation": 0.0,
-                    "method": "french",
-                    "down_payment": float(st.session_state.get(f"cao_upfront_{idx}", 0.0) or 0.0),
-                    "residual_value": float(st.session_state.get(f"cao_residual_{idx}", 0.0) or 0.0),
-                }
-                draft = {
-                    "problem_type": "compare_loans",
-                    "currency": pd.get("currency", "USD"),
-                    "inputs": {"loans": [loan]}
-                }
-                # prime the structured form state with this draft
-                _prime_structured_form_state(draft)
-                st.success("Opción copiada a 'Comparar préstamos'. Ve al modo 'Comparar préstamos' para completar y analizar.")
-                st.experimental_rerun()
+        # Calculation for compare_loans - build metrics selection
         metric_choice = st.selectbox(
             "¿Qué métrica quieres comparar?",
             ["total_interest", "total_paid", "implied_rate", "monthly_payment"],
@@ -1888,118 +1856,12 @@ def _render_structured_problem_builder(currency: str):
         )
         
         if calculate_clicked:
-            # First, try to fill missing periods using other loans or a sane default
-            # Ensure `loans` is defined (may be absent if not in compare_loans mode)
-            if 'loans' not in locals():
-                loans = []
-
-            detected_periods = [int(l.get("periods") or 0) for l in loans if (l.get("periods") or 0) > 0]
-            default_period = detected_periods[0] if detected_periods else 63
-
-            for l in loans:
-                # If periods missing but total_obligation present, set to default_period
-                if not (l.get("periods") or 0) and (l.get("total_obligation") or 0) > 0:
-                    l["periods"] = default_period
-
-            # Now derive monthly payments when possible (total_obligation / periods)
-            for l in loans:
-                if not (l.get("monthly_payment") or 0) and (l.get("total_obligation") or 0) > 0 and (l.get("periods") or 0) > 0:
-                    try:
-                        l["monthly_payment"] = float(l.get("total_obligation", 0)) / float(l.get("periods", 1))
-                    except Exception:
-                        l["monthly_payment"] = 0
-
-            # Build valid_loans using relaxed rules: accept loans with periods>0 and at least one of principal/monthly/total_obligation
-            valid_loans = []
-            for l in loans:
-                periods_ok = (l.get("periods") or 0) > 0
-                principal_ok = (l.get("principal") or 0) > 0
-                monthly_ok = (l.get("monthly_payment") or 0) > 0
-                total_ok = (l.get("total_obligation") or 0) > 0
-
-                if periods_ok and (principal_ok or monthly_ok or total_ok):
-                    valid_loans.append(l)
-
-            if len(valid_loans) < 2:
-                # If we have asset options available, offer to import them as loans
-                cao_count = st.session_state.get("cao_option_count", 0)
-                pd = st.session_state.get("problem_draft", {}) or {}
-                # If this is actually an asset comparison, auto-convert the options instead of blocking.
-                if pd.get("problem_type") == "compare_asset_options" and cao_count and cao_count > 0:
-                    loans_from_cao = []
-                    for i in range(1, cao_count + 1):
-                        upfront = float(st.session_state.get(f"cao_upfront_{i}", 0.0) or 0.0)
-                        monthly = float(st.session_state.get(f"cao_monthly_{i}", 0.0) or 0.0)
-                        term = int(st.session_state.get(f"cao_term_{i}", 0) or 0)
-                        residual = float(st.session_state.get(f"cao_residual_{i}", 0.0) or 0.0)
-                        lease_buy_price = float(st.session_state.get(f"cao_lease_buy_price_{i}", 0.0) or 0.0)
-                        principal = upfront if upfront > 0 else (lease_buy_price if lease_buy_price > 0 else 0.0)
-                        total_obligation = float(monthly) * int(term) if monthly > 0 and term > 0 else 0.0
-                        loans_from_cao.append({
-                            "name": st.session_state.get(f"cao_name_{i}", f"Opción {i}"),
-                            "principal": principal,
-                            "rate": 0.0,
-                            "rate_type": st.session_state.get("cao_rate_type", "effective_annual"),
-                            "periods": term,
-                            "monthly_payment": monthly,
-                            "fees_capitalized": 0.0,
-                            "total_obligation": total_obligation,
-                            "down_payment": upfront,
-                            "residual_value": residual,
-                            "method": "french",
-                        })
-
-                    loans = loans_from_cao
-                    valid_loans = []
-                    for l in loans:
-                        periods_ok = (l.get("periods") or 0) > 0
-                        principal_ok = (l.get("principal") or 0) > 0
-                        monthly_ok = (l.get("monthly_payment") or 0) > 0
-                        total_ok = (l.get("total_obligation") or 0) > 0
-                        if periods_ok and (principal_ok or monthly_ok or total_ok):
-                            valid_loans.append(l)
-                    st.info("Se importaron automáticamente las opciones de compra/leasing/renta para poder compararlas como flujo de caja.")
-                elif cao_count and cao_count > 0:
-                    st.info("No hay suficientes préstamos completos. Puedes importar las opciones (compra/leasing/renta) como préstamos para analizarlas aquí.")
-                    if st.button("Importar opciones como préstamos", key="import_cao_to_loans"):
-                        loans_from_cao = []
-                        for i in range(1, cao_count + 1):
-                            upfront = float(st.session_state.get(f"cao_upfront_{i}", 0.0) or 0.0)
-                            monthly = float(st.session_state.get(f"cao_monthly_{i}", 0.0) or 0.0)
-                            term = int(st.session_state.get(f"cao_term_{i}", 0) or 0)
-                            residual = float(st.session_state.get(f"cao_residual_{i}", 0.0) or 0.0)
-                            lease_buy_price = float(st.session_state.get(f"cao_lease_buy_price_{i}", 0.0) or 0.0)
-                            principal = upfront if upfront > 0 else (lease_buy_price if lease_buy_price > 0 else 0.0)
-                            total_obligation = float(monthly) * int(term) if monthly > 0 and term > 0 else 0.0
-                            loan = {
-                                "name": st.session_state.get(f"cao_name_{i}", f"Opción {i}"),
-                                "principal": principal,
-                                "rate": 0.0,
-                                "rate_type": st.session_state.get("cao_rate_type", pd.get("currency", "effective_annual")),
-                                "periods": term,
-                                "monthly_payment": monthly,
-                                "fees_capitalized": 0.0,
-                                "total_obligation": total_obligation,
-                                "down_payment": upfront,
-                                "residual_value": residual,
-                                "method": "french",
-                            }
-                            loans_from_cao.append(loan)
-
-                        draft = {
-                            "problem_type": "compare_loans",
-                            "currency": pd.get("currency", "USD"),
-                            "inputs": {"loans": loans_from_cao},
-                        }
-                        _prime_structured_form_state(draft)
-                        st.success("Opciones importadas como préstamos. Revisa las cajas y vuelve a calcular.")
-                        st.experimental_rerun()
-                else:
-                    st.warning("⚠️ Necesitas al menos 2 préstamos con datos suficientes (plazo>0 y principal/cuota/obligación).")
+            if len(loans) < 2:
+                st.warning("⚠️ Necesitas al menos 2 préstamos con datos suficientes (plazo>0 y principal/cuota/obligación).")
             else:
                 with st.spinner("Calculando métricas..."):
                     # Calculate all metrics
-                    comparison = _calculate_comparison_metrics(valid_loans, metric_choice)
+                    comparison = _calculate_comparison_metrics(loans, metric_choice)
                     
                     # Display results
                     st.success(f"✅ Comparación por: **{comparison['metric_label']}**")
