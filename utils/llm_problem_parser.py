@@ -44,7 +44,7 @@ class LLMProblemParser:
             raise ValueError("OPENAI_API_KEY no está configurada en .env")
         self.client = OpenAI(api_key=api_key)
     
-    def parse_problem(self, problem_statement: str) -> dict[str, Any]:
+    def parse_problem(self, problem_statement: str, problem_focus: str | None = None) -> dict[str, Any]:
         """
         Parsea un enunciado de problema financiero.
         
@@ -73,7 +73,7 @@ class LLMProblemParser:
         """
         try:
             # Construir el prompt para el LLM
-            prompt = self._build_extraction_prompt(problem_statement)
+            prompt = self._build_extraction_prompt(problem_statement, problem_focus=problem_focus)
             
             # Llamar al LLM
             response = self.client.chat.completions.create(
@@ -138,12 +138,41 @@ Formato de salida esperado:
                 "error": f"Error en el parser LLM: {str(e)}"
             }
     
-    def _build_extraction_prompt(self, problem_statement: str) -> str:
+    def _build_extraction_prompt(self, problem_statement: str, problem_focus: str | None = None) -> str:
         """Construye el prompt para el LLM."""
+        focus_instructions = ""
+        if problem_focus:
+            focus_map = {
+                "comparar_creditos": "Prioriza comparar costo total futuro, cuotas, plazo, tasa y cualquier pago inicial o residual entre opciones de crédito/leasing/refinanciamiento.",
+                "prestamo": "Prioriza identificar monto financiado, tasa, plazo, cuota y monto total a pagar.",
+                "valor_presente": "Prioriza identificar el flujo futuro, tasa y plazo para traer el valor a presente.",
+                "valor_futuro": "Prioriza identificar el valor inicial, tasa y plazo para proyectar el valor futuro.",
+                "amortizacion": "Prioriza cuota, tasa, plazo, saldo, capital e intereses para el sistema de amortización.",
+                "depreciacion": "Prioriza costo del activo, vida útil, valor residual y método de depreciación.",
+                "flujos_caja": "Prioriza identificar flujos de caja, fechas, tasas y cualquier VAN/TIR relevante."
+            }
+            focus_label = {
+                "comparar_creditos": "comparar créditos / refinanciamiento",
+                "prestamo": "pedir un préstamo",
+                "valor_presente": "traer a valor presente",
+                "valor_futuro": "calcular valor futuro",
+                "amortizacion": "amortización",
+                "depreciacion": "depreciación",
+                "flujos_caja": "flujos de caja"
+            }.get(problem_focus, problem_focus)
+            focus_instructions = f"""
+FOCO DE INTERPRETACIÓN SELECCIONADO POR EL USUARIO: {focus_label}
+INSTRUCCIÓN ESPECIAL:
+{focus_map.get(problem_focus, '')}
+
+"""
+
         return f"""Analiza el siguiente problema financiero y extrae su estructura en JSON:
 
 PROBLEMA:
 {problem_statement}
+
+{focus_instructions}
 
 INSTRUCCIONES:
 1. Identifica TODAS las opciones/alternativas mencionadas (ej: "opción A", "préstamo", "leasing", etc)
