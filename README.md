@@ -1,5 +1,5 @@
-# 🏦 Bank Statement Analyzer
-*AI-powered financial analysis through intelligent multi-agent processing. 
+# 🏦 Finances Advisor
+*Bank Statement Analyzer + Solucionador de Problemas Financieros v2. 
 Video Presentation - [Click Here](https://www.youtube.com/watch?v=kiBZ86F8_SU)*
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
@@ -23,10 +23,10 @@ Video Presentation - [Click Here](https://www.youtube.com/watch?v=kiBZ86F8_SU)*
 
 ## 🎯 Overview
 
-Transform PDF bank statements into comprehensive financial insights using a hybrid multi-agent system. The analyzer combines deterministic processing with strategic AI usage to deliver fast, accurate, and cost-effective financial analysis.
+Transform PDF bank statements into comprehensive financial insights using a hybrid multi-agent system, and solve everyday financial problems with a separate deterministic solver guided by OpenAI only for parsing.
 
-**The Problem**: Manual bank statement analysis is time-consuming and error-prone  
-**The Solution**: Automated system that reads, categorizes, and analyzes transactions with minimal AI costs
+**The Problem**: Manual bank statement analysis and financial problem-solving are time-consuming and error-prone  
+**The Solution**: A two-mode Streamlit app that keeps calculations local and uses AI only where it adds value
 
 ---
 
@@ -40,12 +40,13 @@ Transform PDF bank statements into comprehensive financial insights using a hybr
 📚 **Knowledge-Driven Advisory** - Uses `data/advisory_knowledge_base_v1.json` for rules, benchmarks, and playbooks  
 🎨 **Beautiful Web Interface** - Professional Streamlit dashboard with interactive charts  
 💰 **Transparent Cost Tracking** - Shows base analysis cost, incremental meta-analysis cost, and total cost  
+🧮 **Problemas cotidianos v2** - Focus-guided problem parser + deterministic calculator for loans, present/future value, amortization, depreciation, and cash flows
 
 ---
 
 ## 🏗️ System Architecture
 
-### Three-Agent Design
+### Bank Statement Analyzer: Three-Agent Design
 
 ```
 🏗️ Agent 1: Document Processor (0 LLM)
@@ -98,6 +99,20 @@ graph TD
 📊 Agent 3: Financial analysis → ✍️ Human category review (optional edits) → 🧠 Meta analysis button (optional) → 🎨 Beautiful dashboard
 ```
 
+### Problemas cotidianos v2: Parser + Calculator
+
+```
+🧠 User problem in natural language
+    ↓
+🔍 LLM parser extracts structure and assumptions only
+    ↓
+✅ User validates parsed values and assumptions
+    ↓
+🧮 Deterministic calculator computes the results locally
+    ↓
+🎨 Results table with assumptions highlighted
+```
+
 ---
 
 ## 🧠 Meta Analysis Layer
@@ -142,6 +157,9 @@ cd personal-finance-advisor
 python -m venv venv
 source venv/bin/activate
 
+# Windows PowerShell
+# .\venv\Scripts\Activate.ps1
+
 # Install dependencies
 pip install -r requirements.txt
 
@@ -154,9 +172,9 @@ streamlit run streamlit_app.py
 
 ### First Analysis
 1. Open browser to `http://localhost:8501`
-2. Upload bank statement PDF
-3. Choose analysis options
-4. View interactive results
+2. Use the sidebar to choose between `Análisis de cartola` and `Problemas cotidianos`
+3. Upload a bank statement PDF or enter a financial problem in natural language
+4. Review the results and adjust parameters when needed
 
 ---
 
@@ -166,13 +184,24 @@ streamlit run streamlit_app.py
 ```bash
 streamlit run streamlit_app.py
 ```
-Professional dashboard with drag-and-drop upload, interactive visualizations, manual category correction, and optional meta-analysis reporting.
+Professional dashboard with drag-and-drop upload, interactive visualizations, manual category correction, optional meta-analysis reporting, and the new `Problemas cotidianos` solver.
+
+### Problemas cotidianos v2 Standalone
+```bash
+streamlit run streamlit_problem_solver_v2.py
+```
+Standalone solver for loans, present value, future value, amortization, depreciation, and cash-flow problems.
 
 ### Command Line
 ```bash
 python main_coordinator.py
 ```
 Terminal interface for batch processing and automation.
+
+### Platform Notes
+- macOS and Linux: use `source venv/bin/activate`
+- Windows PowerShell: use `venv\Scripts\Activate.ps1`
+- The app itself is cross-platform; only the shell activation command changes.
 
 ### Python API
 ```python
@@ -187,8 +216,9 @@ result = analyzer.analyze_statement("statement.pdf")
 ## 📁 Project Structure
 
 ```
-personal-finance-advisor/
+Finances_Advisor/
 ├── streamlit_app.py              # Web interface
+├── streamlit_problem_solver_v2.py # Standalone financial problem solver
 ├── main_coordinator.py           # System orchestration
 ├── agents/                       # Core agents
 │   ├── document_processor.py     # Agent 1: PDF processing
@@ -199,8 +229,11 @@ personal-finance-advisor/
 │   └── advisory_knowledge_base_v1.json   # Knowledge base for meta-analysis rules/benchmarks/playbooks
 ├── utils/                        # Shared utilities
 │   ├── llm_interface.py          # AI management
-│   └── merchant_database.py      # Categorization rules
+│   ├── merchant_database.py      # Categorization rules
+│   ├── llm_problem_parser.py     # LLM parser for Problemas cotidianos
+│   └── financial_calculator_v2.py # Deterministic calculator for solver v2
 ├── tests/                        # Test suite
+│   └── test_problem_solver_v2.py # Tests for the new solver
 └── bank_statements/              # Sample data
 ```
 
@@ -211,11 +244,12 @@ personal-finance-advisor/
 ### Run Tests
 ```bash
 # Complete system test
-python -m tests.test_complete_system
+pytest tests/test_complete_system.py
 
 # Individual components
-python -m tests.test_agent1    # PDF processing
-python -m tests.test_agent2    # AI categorization
+pytest tests/test_agent1.py    # PDF processing
+pytest tests/test_agent2.py    # AI categorization
+pytest tests/test_problem_solver_v2.py
 ```
 
 ### Test Coverage
@@ -230,6 +264,8 @@ python -m tests.test_agent2    # AI categorization
 ## ⚠️ Important Notes
 
 ### 🔒 Security Warning
+
+**Security posture**: the app only makes one external call, to OpenAI API via `OPENAI_API_KEY`. All financial calculations and local processing run inside the app.
 
 **⚠️ EDUCATIONAL PROJECT ONLY**
 

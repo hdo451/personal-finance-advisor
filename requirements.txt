@@ -1,12 +1,17 @@
-openai>=1.30.0
-requests>=2.28.0
-python-dateutil>=2.8.0
-pytz>=2023.0
-pdfplumber>=0.10.0
-python-dotenv>=1.0.0
+# Core app + shared UI
 streamlit>=1.28.0
 streamlit-plotly-events>=0.0.6
 plotly>=5.17.0
 pandas>=2.0.0
+
+# Bank statement analyzer
+pdfplumber>=0.10.0
+requests>=2.28.0
+python-dateutil>=2.8.0
+pytz>=2023.0
+
+# Problemas cotidianos v2
+openai>=1.30.0
+python-dotenv>=1.0.0
 numpy-financial>=1.0.0
 scipy>=1.0.0

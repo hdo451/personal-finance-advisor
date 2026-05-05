@@ -1464,6 +1464,14 @@ def main():
     # Sidebar - System Information
     with st.sidebar:
         st.header("🤖 System Status")
+
+        st.divider()
+        workspace_mode = st.radio(
+            "Módulo",
+            ["Análisis de cartola", "Problemas cotidianos"],
+            index=0,
+            help="Selecciona entre análisis de estados de cuenta y resolución de problemas financieros cotidianos"
+        )
         
         if st.session_state.analyzer:
             st.success("✅ All agents initialized")
@@ -1492,22 +1500,14 @@ def main():
         else:
             st.error("❌ System initialization failed")
             st.write("Please check your .env file contains OPENAI_API_KEY")
-
-        st.divider()
-        workspace_mode = st.radio(
-            "Módulo",
-            ["Análisis de cartola", "Problemas cotidianos"],
-            index=0,
-            help="Selecciona entre análisis de estados de cuenta y resolución de problemas financieros cotidianos"
-        )
     
     # Main content area
-    if not st.session_state.analyzer:
-        st.error("System not initialized. Please check your API key configuration.")
-        return
-
     if workspace_mode == "Problemas cotidianos":
         render_problem_solver_page()
+        return
+
+    if not st.session_state.analyzer:
+        st.error("System not initialized. Please check your API key configuration.")
         return
     
     # File upload section

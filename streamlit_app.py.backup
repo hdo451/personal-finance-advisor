@@ -16,6 +16,7 @@ import os
 import copy
 from pathlib import Path
 from dotenv import load_dotenv
+from streamlit_problem_solver_v2 import render_problem_solver_page as render_problem_solver_page_v2
 
 try:
     from streamlit_plotly_events import plotly_events
@@ -1076,166 +1077,7 @@ def _render_structured_problem_builder(currency: str):
 
 
 def render_problem_solver_page():
-    st.header("🧮 Problemas cotidianos")
-    st.caption("Resuelve preguntas financieras en lenguaje natural con cálculo determinístico en Python y redacción ejecutiva asistida por LLM.")
-
-    input_mode = st.radio(
-        "Modo de entrada",
-        ["Formulario estructurado", "Texto libre asistido"],
-        index=0,
-        horizontal=True,
-        key="problem_solver_input_mode",
-    )
-
-    question = ""
-    if input_mode == "Texto libre asistido":
-        question = st.text_area(
-            "Describe tu problema financiero",
-            placeholder="Ej: ¿Me conviene crédito A o B para comprar auto?"
-        )
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        currency = st.selectbox("Moneda", ["MXN", "USD"], index=0)
-    with col2:
-        st.text_input("Periodicidad", value="monthly", disabled=True)
-    with col3:
-        st.text_input("Base de días", value="365", disabled=True)
-
-    if input_mode == "Texto libre asistido":
-        if st.button("🧠 Interpretar problema", type="secondary", use_container_width=True):
-            if not question.strip():
-                st.warning("Escribe una pregunta antes de interpretar.")
-            else:
-                try:
-                    with st.spinner("Interpretando y ordenando datos..."):
-                        parsed = _interpret_problem_to_json(question.strip(), currency)
-                        st.session_state.problem_source_question = question.strip()
-                        st.session_state.problem_draft = parsed["draft"]
-                        st.session_state.problem_draft_text = json.dumps(parsed["draft"], ensure_ascii=False, indent=2)
-                        st.session_state.problem_solver_metrics = {
-                            "parse_llm_calls": parsed["metrics"]["llm_calls"],
-                            "parse_cost": parsed["metrics"]["estimated_cost"],
-                            "narrative_llm_calls": 0,
-                            "narrative_cost": 0.0,
-                        }
-                        st.session_state.problem_solver_error = None
-                except Exception as e:
-                    st.session_state.problem_solver_error = str(e)
-    else:
-        structured_payload = _render_structured_problem_builder(currency)
-        if structured_payload:
-            st.session_state.problem_source_question = "Formulario estructurado"
-            st.session_state.problem_draft = structured_payload
-            st.session_state.problem_draft_text = json.dumps(structured_payload, ensure_ascii=False, indent=2)
-            st.session_state.problem_solver_metrics = {
-                "parse_llm_calls": 0,
-                "parse_cost": 0.0,
-                "narrative_llm_calls": 0,
-                "narrative_cost": 0.0,
-            }
-            st.session_state.problem_solver_error = None
-
-    if st.session_state.get("problem_draft_text"):
-        st.subheader("📋 Datos reordenados (requiere autorización humana)")
-        st.caption("Revisa y edita el JSON antes de resolver. El cálculo solo corre cuando autorizas.")
-
-        draft_dict = st.session_state.get("problem_draft", {})
-        defaults_used = draft_dict.get("defaults_used", [])
-        
-        if defaults_used:
-            defaults_markdown = "".join([
-                f"<li style='margin-bottom: 8px;'><span style='color:#b00020; font-weight:700;'>{d}</span></li>"
-                for d in defaults_used
-            ])
-            st.markdown(
-                f"""
-                <div style="background-color: #fff0f0; border: 2px solid #d32f2f; color: #b00020; padding: 16px; border-radius: 8px; margin-bottom: 15px;">
-                    <strong style="font-size: 1.05rem;">⚠️ ATENCIÓN - DATOS ASUMIDOS AUTOMÁTICAMENTE:</strong><br>
-                    <span style="font-weight: 700;">El problema no contenía toda la información necesaria.</span>
-                    Se inyectaron estos supuestos para poder calcular. Revisa cada uno y modifícalo si deseas trabajar con otro valor:<br><br>
-                    <ul style="margin-top: 8px; margin-bottom: 0; padding-left: 22px;">
-                        {defaults_markdown}
-                    </ul>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-        edited = st.text_area(
-            "JSON autorizado",
-            value=st.session_state.problem_draft_text,
-            height=360,
-            key="problem_solver_json_editor",
-        )
-
-        if st.button("✅ Autorizar y resolver", type="primary", use_container_width=True):
-            try:
-                authorized_payload = json.loads(edited)
-                solved = _solve_authorized_problem(authorized_payload)
-                narrative_question = question.strip() or st.session_state.get("problem_source_question", "Formulario estructurado")
-
-                # Validate deterministic solver result before generating narrative
-                try:
-                    _validate_solved_result(solved)
-                except Exception as e:
-                    st.session_state.problem_solver_error = f"Validación del cálculo falló: {e}"
-                    st.session_state.problem_solver_result = solved
-                    st.session_state.problem_solver_narrative = None
-                    st.session_state.problem_solver_metrics = st.session_state.problem_solver_metrics or {}
-                    raise
-
-                narrative = _generate_problem_narrative(narrative_question, solved)
-
-                metrics = st.session_state.problem_solver_metrics or {
-                    "parse_llm_calls": 0,
-                    "parse_cost": 0.0,
-                    "narrative_llm_calls": 0,
-                    "narrative_cost": 0.0,
-                }
-                metrics["narrative_llm_calls"] = narrative["metrics"]["llm_calls"]
-                metrics["narrative_cost"] = narrative["metrics"]["estimated_cost"]
-                metrics["total_llm_calls"] = metrics["parse_llm_calls"] + metrics["narrative_llm_calls"]
-                metrics["total_cost"] = metrics["parse_cost"] + metrics["narrative_cost"]
-
-                st.session_state.problem_solver_result = solved
-                st.session_state.problem_solver_narrative = narrative["text"]
-                st.session_state.problem_solver_metrics = metrics
-                st.session_state.problem_solver_error = None
-            except Exception as e:
-                # If we re-raised a validation error, it's already in session_state; otherwise record
-                if not st.session_state.get('problem_solver_error'):
-                    st.session_state.problem_solver_error = str(e)
-
-    if st.session_state.get("problem_solver_error"):
-        st.error(f"Error en resolución: {st.session_state.problem_solver_error}")
-
-    solved = st.session_state.get("problem_solver_result")
-    if solved:
-        metrics = st.session_state.get("problem_solver_metrics", {})
-
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            st.metric("LLM interpretación", metrics.get("parse_llm_calls", 0), f"${metrics.get('parse_cost', 0.0):.4f}")
-        with m2:
-            st.metric("LLM redacción", metrics.get("narrative_llm_calls", 0), f"${metrics.get('narrative_cost', 0.0):.4f}")
-        with m3:
-            st.metric("Costo total etapa", f"{metrics.get('total_llm_calls', 0)} calls", f"${metrics.get('total_cost', 0.0):.4f}")
-
-        st.subheader("🧾 Trazabilidad")
-        st.json(
-            {
-                "inputs": solved.get("trace", {}).get("inputs", {}),
-                "assumptions": solved.get("trace", {}).get("assumptions", []),
-                "formula": solved.get("trace", {}).get("formula", ""),
-                "result": solved.get("trace", {}).get("result", {}),
-                "timestamp": solved.get("timestamp"),
-            }
-        )
-
-        st.subheader("📄 Respuesta ejecutiva")
-        st.markdown(st.session_state.get("problem_solver_narrative", ""))
-        st.caption("Supuestos y defaults usados están documentados en la trazabilidad superior.")
+    render_problem_solver_page_v2()
 
 
 def _generate_executive_summary(result: dict, income: float, expenses: float, savings: float, savings_rate: float, health_status: str) -> str:
@@ -1622,6 +1464,14 @@ def main():
     # Sidebar - System Information
     with st.sidebar:
         st.header("🤖 System Status")
+
+        st.divider()
+        workspace_mode = st.radio(
+            "Módulo",
+            ["Análisis de cartola", "Problemas cotidianos"],
+            index=0,
+            help="Selecciona entre análisis de estados de cuenta y resolución de problemas financieros cotidianos"
+        )
         
         if st.session_state.analyzer:
             st.success("✅ All agents initialized")
@@ -1650,22 +1500,14 @@ def main():
         else:
             st.error("❌ System initialization failed")
             st.write("Please check your .env file contains OPENAI_API_KEY")
-
-        st.divider()
-        workspace_mode = st.radio(
-            "Módulo",
-            ["Análisis de cartola", "Problemas cotidianos"],
-            index=0,
-            help="Selecciona entre análisis de estados de cuenta y resolución de problemas financieros cotidianos"
-        )
     
     # Main content area
-    if not st.session_state.analyzer:
-        st.error("System not initialized. Please check your API key configuration.")
-        return
-
     if workspace_mode == "Problemas cotidianos":
         render_problem_solver_page()
+        return
+
+    if not st.session_state.analyzer:
+        st.error("System not initialized. Please check your API key configuration.")
         return
     
     # File upload section
