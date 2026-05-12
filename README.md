@@ -170,6 +170,18 @@ echo "OPENAI_API_KEY=your_key_here" > .env
 streamlit run streamlit_app.py
 ```
 
+### Streamlit Cloud Deployment
+1. Push the repository to GitHub.
+2. Open [Streamlit Community Cloud](https://streamlit.io/cloud) and create a new app from your repo.
+3. Set the main file path to `streamlit_app.py`.
+4. Add `OPENAI_API_KEY` in the app's Secrets panel, not in the repository.
+5. Deploy and test with non-sensitive documents first.
+
+Example secret format in Streamlit Cloud:
+```toml
+OPENAI_API_KEY = "your_key_here"
+```
+
 ### First Analysis
 1. Open browser to `http://localhost:8501`
 2. Use the sidebar to choose between `Análisis de cartola` and `Problemas cotidianos`
@@ -202,6 +214,7 @@ Terminal interface for batch processing and automation.
 - macOS and Linux: use `source venv/bin/activate`
 - Windows PowerShell: use `venv\Scripts\Activate.ps1`
 - The app itself is cross-platform; only the shell activation command changes.
+- For Streamlit Cloud, prefer app Secrets over `.env`.
 
 ### Python API
 ```python

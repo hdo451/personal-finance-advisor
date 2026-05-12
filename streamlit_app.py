@@ -15,6 +15,7 @@ from datetime import datetime
 import os
 import copy
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 from streamlit_problem_solver_v2 import render_problem_solver_page as render_problem_solver_page_v2
 
@@ -58,16 +59,93 @@ def _transactions_to_editor_df(transactions: list) -> pd.DataFrame:
     rows = []
     for idx, txn in enumerate(transactions):
         rows.append({
-            '_txn_index': idx,
+            '_txn_index': int(txn.get('_global_index', idx)),
             'Date': txn['date'],
+            'Month': txn.get('month', ''),
+            'Person': txn.get('person', ''),
+            'Document': txn.get('source_file_name', ''),
+            'Doc Type': txn.get('document_type', ''),
             'Description': txn['description'],
             'Category': _category_code_to_label(txn['category']),
             'Amount': txn['amount'],
             'Type': 'OUT' if txn['is_debit'] else 'IN',
+            'Counts as spending': bool(txn.get('effective_is_spending', txn.get('is_debit', False))),
+            'Internal transfer?': bool(txn.get('possible_internal_transfer', False)),
             'Confidence': f"{txn['confidence']:.0%}",
             'Source': txn['source'].title()
         })
     return pd.DataFrame(rows)
+
+
+def _filter_transactions(transactions: list, person_filter: str, month_filter: str, document_filter: str) -> list:
+    filtered = []
+    for idx, txn in enumerate(transactions):
+        if person_filter != "Todos" and txn.get('person') != person_filter:
+            continue
+        if month_filter != "Todos" and txn.get('month') != month_filter:
+            continue
+        if document_filter != "Todos" and txn.get('source_file_name') != document_filter:
+            continue
+
+        enriched = dict(txn)
+        enriched['_global_index'] = idx
+        filtered.append(enriched)
+    return filtered
+
+
+def _build_statement_inputs_from_uploads(uploaded_files: list) -> list:
+    """Capture deterministic per-document metadata from the user before analysis."""
+    statement_inputs = []
+
+    st.subheader("🗂️ Metadata por documento")
+    st.caption("Estos campos ayudan a consolidar múltiples cartolas con trazabilidad. Si no estás seguro, deja valores por defecto.")
+
+    for idx, uploaded_file in enumerate(uploaded_files, start=1):
+        with st.expander(f"Documento {idx}: {uploaded_file.name}", expanded=(idx <= 2)):
+            col1, col2 = st.columns(2)
+            with col1:
+                document_type = st.selectbox(
+                    "Tipo de documento",
+                    ["bank_account", "credit_card", "other"],
+                    index=0,
+                    key=f"meta_doc_type_{idx}",
+                    format_func=lambda x: {
+                        "bank_account": "Cuenta bancaria",
+                        "credit_card": "Tarjeta de crédito",
+                        "other": "Otro",
+                    }.get(x, x),
+                )
+                person = st.text_input(
+                    "Persona asociada",
+                    value=f"persona_{idx}",
+                    key=f"meta_person_{idx}",
+                    help="Ejemplo: marido, mujer, conjunta, hijo, etc.",
+                ).strip() or f"persona_{idx}"
+            with col2:
+                account_label = st.text_input(
+                    "Etiqueta de cuenta",
+                    value=f"cuenta_{idx}",
+                    key=f"meta_account_{idx}",
+                    help="Ejemplo: cuenta corriente BCI, tarjeta visa banco X",
+                ).strip() or f"cuenta_{idx}"
+                institution = st.text_input(
+                    "Institución (opcional)",
+                    value="",
+                    key=f"meta_institution_{idx}",
+                ).strip()
+
+            statement_inputs.append({
+                'uploaded_file': uploaded_file,
+                'metadata': {
+                    'file_name': uploaded_file.name,
+                    'document_type': document_type,
+                    'person': person,
+                    'account_label': account_label,
+                    'institution': institution,
+                }
+            })
+
+    return statement_inputs
 
 def _get_category_items_for_modal(transactions: list, category_label: str) -> list:
     """Return debit transactions for the selected category, preserving table order."""
@@ -82,6 +160,21 @@ def _get_category_items_for_modal(transactions: list, category_label: str) -> li
             })
 
     return category_items
+
+
+def _get_openai_api_key() -> Optional[str]:
+    """Resolve the API key from Streamlit secrets first, then local environment fallback.
+
+    Streamlit Cloud should store the key in Secrets. Local development can still use .env.
+    """
+    try:
+        if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
+            return str(st.secrets["OPENAI_API_KEY"]).strip() or None
+    except Exception:
+        pass
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    return api_key.strip() if api_key else None
 
 
 @st.cache_data(show_spinner=False)
@@ -1418,7 +1511,7 @@ def initialize_session_state():
     """Initialize Streamlit session state"""
     if 'analyzer' not in st.session_state:
         load_dotenv()
-        api_key = os.getenv('OPENAI_API_KEY')
+        api_key = _get_openai_api_key()
         
         if api_key:
             with st.spinner("🏗️ Initializing 3-agent system..."):
@@ -1426,7 +1519,7 @@ def initialize_session_state():
             st.success("✅ System ready!")
         else:
             st.session_state.analyzer = None
-            st.error("❌ Please set OPENAI_API_KEY in .env file")
+            st.error("❌ Missing OPENAI_API_KEY. In Streamlit Cloud, add it in App secrets; locally, set it in .env.")
 
     if 'analysis_result' not in st.session_state:
         st.session_state.analysis_result = None
@@ -1511,18 +1604,22 @@ def main():
         return
     
     # File upload section
-    st.header("📄 Upload Bank Statement")
+    st.header("📄 Upload Bank Statements")
     
-    uploaded_file = st.file_uploader(
-        "Choose a bank statement PDF file",
+    uploaded_files = st.file_uploader(
+        "Choose one or more bank statement PDF files",
         type=['pdf'],
-        help="Upload your bank statement PDF for automated analysis"
+        accept_multiple_files=True,
+        help="Upload one or many statements/cartolas for consolidated analysis"
     )
     
-    if uploaded_file:
-        # Show file info
-        st.info(f"📄 **File**: {uploaded_file.name} ({uploaded_file.size:,} bytes)")
-        
+    if uploaded_files:
+        st.info(f"📦 **Archivos seleccionados**: {len(uploaded_files)}")
+        for up in uploaded_files:
+            st.write(f"• {up.name} ({up.size:,} bytes)")
+
+        statement_inputs = _build_statement_inputs_from_uploads(uploaded_files)
+
         # Analysis options
         col1, col2 = st.columns(2)
         
@@ -1535,13 +1632,13 @@ def main():
         
         with col2:
             if generate_insights:
-                st.info("📊 Will use 2 LLM calls (~$0.004)")
+                st.info("📊 Se usarán llamadas LLM adicionales para recomendaciones")
             else:
-                st.info("📊 Will use 1 LLM call (~$0.002)")
+                st.info("📊 Modo determinístico + categorización mínima con LLM")
         
         # Analysis button
-        if st.button("🚀 Analyze Statement", type="primary", use_container_width=True):
-            process_uploaded_file(uploaded_file, generate_insights)
+        if st.button("🚀 Analyze Statements", type="primary", use_container_width=True):
+            process_uploaded_files(statement_inputs, generate_insights)
 
         if st.session_state.analysis_result:
             show_debug_diagnostics(st.session_state.analysis_result)
@@ -1564,92 +1661,88 @@ def main():
         for sample in sample_files:
             st.write(f"• {sample}")
 
-def process_uploaded_file(uploaded_file, generate_insights: bool):
-    """Process the uploaded file and show results"""
-    
-    # Save uploaded file temporarily
-    temp_path = f"temp_{uploaded_file.name}"
-    
+def process_uploaded_files(statement_inputs: list, generate_insights: bool):
+    """Process one or multiple uploaded files and show consolidated results."""
+    temp_paths = []
+
     try:
-        # Write uploaded file to disk
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        
-        # Create processing progress
+        statements_for_analysis = []
+        for idx, statement in enumerate(statement_inputs, start=1):
+            uploaded_file = statement['uploaded_file']
+            temp_path = f"temp_{idx}_{uploaded_file.name}"
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            temp_paths.append(temp_path)
+
+            statements_for_analysis.append({
+                'pdf_path': temp_path,
+                'metadata': statement.get('metadata', {}),
+            })
+
         progress_container = st.container()
-        
+
         with progress_container:
             st.subheader("🔄 Processing Pipeline")
-            
-            # Progress indicators
             progress_bar = st.progress(0)
             status_text = st.empty()
-            
-            # Agent processing steps
+
             agent_cols = st.columns(3)
-            
             with agent_cols[0]:
                 agent1_status = st.empty()
                 agent1_status.info("🏗️ Agent 1: Waiting...")
-            
+
             with agent_cols[1]:
                 agent2_status = st.empty()
                 agent2_status.info("🧠 Agent 2: Waiting...")
-            
+
             with agent_cols[2]:
                 agent3_status = st.empty()
                 agent3_status.info("📊 Agent 3: Waiting...")
-            
-            # Step 1: Agent 1
-            status_text.text("🏗️ Agent 1: Processing PDF...")
-            agent1_status.warning("🏗️ Agent 1: Processing PDF...")
+
+            status_text.text("🏗️ Agent 1: Processing PDFs...")
+            agent1_status.warning("🏗️ Agent 1: Processing documents...")
             progress_bar.progress(20)
-            
-            # Step 2: Agent 2
+
             status_text.text("🧠 Agent 2: Smart categorization...")
             agent1_status.success("🏗️ Agent 1: ✅ Complete")
             agent2_status.warning("🧠 Agent 2: Categorizing...")
             progress_bar.progress(60)
-            
-            # Step 3: Agent 3
+
             if generate_insights:
                 status_text.text("📊 Agent 3: Generating AI insights...")
             else:
-                status_text.text("📊 Agent 3: Generating analysis...")
-            
-            agent2_status.success("🧠 Agent 2: ✅ Complete") 
+                status_text.text("📊 Agent 3: Generating deterministic analysis...")
+
+            agent2_status.success("🧠 Agent 2: ✅ Complete")
             agent3_status.warning("📊 Agent 3: Analyzing...")
             progress_bar.progress(90)
-            
-            # Run the actual analysis
-            result = st.session_state.analyzer.analyze_statement(
-                temp_path,
+
+            result = st.session_state.analyzer.analyze_statements(
+                statements_for_analysis,
                 generate_ai_insights=generate_insights
             )
-            
-            # Complete
+
             agent3_status.success("📊 Agent 3: ✅ Complete")
             progress_bar.progress(100)
             status_text.text("✅ Analysis complete!")
-        
-        # Display results
+
         if result['success']:
             st.session_state.analysis_result = result
             st.session_state.generate_ai_insights = generate_insights
             _clear_meta_analysis_state()
-            st.success("🎉 Analysis completed successfully!")
+            st.success("🎉 Consolidated analysis completed successfully!")
         else:
             st.error(f"❌ Analysis failed: {result['error']}")
-            st.info("Tip: If this is a local bank statement/cartola, try a cleaner PDF export (text-based, not scanned image).")
+            st.info("Tip: Try cleaner PDF exports (text-based, not scanned image).")
             show_debug_diagnostics(result)
-    
+
     except Exception as e:
-        st.error(f"❌ Error processing file: {str(e)}")
-    
+        st.error(f"❌ Error processing files: {str(e)}")
+
     finally:
-        # Clean up temporary file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        for temp_path in temp_paths:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
 def display_results(result: dict):
     """Display beautiful analysis results"""
@@ -1661,6 +1754,24 @@ def display_results(result: dict):
     metrics = result['system_metrics']
     
     st.header("📊 Financial Analysis Results")
+
+    all_transactions = result.get('transactions', [])
+    available_persons = sorted({t.get('person', '') for t in all_transactions if t.get('person')})
+    available_months = sorted({t.get('month', '') for t in all_transactions if t.get('month')})
+    available_docs = sorted({t.get('source_file_name', '') for t in all_transactions if t.get('source_file_name')})
+
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    with filter_col1:
+        person_filter = st.selectbox("Persona", ["Todos"] + available_persons, key="results_filter_person")
+    with filter_col2:
+        month_filter = st.selectbox("Mes", ["Todos"] + available_months, key="results_filter_month")
+    with filter_col3:
+        document_filter = st.selectbox("Documento", ["Todos"] + available_docs, key="results_filter_document")
+
+    filtered_transactions = _filter_transactions(all_transactions, person_filter, month_filter, document_filter)
+    if not filtered_transactions and all_transactions:
+        st.warning("No hay transacciones para la combinación de filtros seleccionada.")
+        filtered_transactions = all_transactions
     
     # Key metrics in cards
     col1, col2, col3, col4 = st.columns(4)
@@ -1691,9 +1802,31 @@ def display_results(result: dict):
     with col4:
         st.metric(
             "🤖 System Efficiency",
-            f"{metrics['total_llm_calls']}/2 LLM calls",
+            f"{metrics['total_llm_calls']} LLM calls",
             delta=f"${metrics['estimated_cost']:.4f} cost"
         )
+
+    st.caption(
+        f"Transacciones visibles: {len(filtered_transactions)} / {len(all_transactions)} "
+        f"(filtros aplicados por persona/mes/documento)"
+    )
+
+    monthly_summary = result.get('monthly_summary', [])
+    monthly_trends = result.get('monthly_trends', {})
+    if monthly_summary:
+        st.subheader("🗓️ Monthly Consolidation")
+        month_df = pd.DataFrame(monthly_summary)
+        if not month_df.empty:
+            st.dataframe(
+                month_df[['month', 'total_income', 'total_spent', 'net_change', 'transaction_count']],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if monthly_trends:
+            trend_label = monthly_trends.get('classification', 'unknown')
+            trend_details = monthly_trends.get('details', '')
+            st.info(f"Tendencia: **{trend_label}**. {trend_details}")
     
     # Charts section
     if categories:
@@ -1704,90 +1837,109 @@ def display_results(result: dict):
             
             # Build the pie from raw debit transactions so each slice reflects total spend.
             spending_totals = {}
-            for txn in result['transactions']:
-                if txn['is_debit']:
+            for txn in filtered_transactions:
+                if txn.get('is_debit') and txn.get('effective_is_spending', True):
                     category_label = txn['category'].replace('_', ' ').title()
                     spending_totals[category_label] = spending_totals.get(category_label, 0.0) + float(txn['amount'])
 
-            spending_rows = (
-                pd.DataFrame(
-                    [{
-                        'Category': category,
-                        'Amount': float(amount)
-                    } for category, amount in spending_totals.items()]
-                )
-                .sort_values('Amount', ascending=False)
-                .reset_index(drop=True)
-            )
-
-            category_names = spending_rows['Category'].tolist()
-            category_amounts = spending_rows['Amount'].tolist()
-            pie_colors = px.colors.qualitative.Set3 + px.colors.qualitative.Pastel + px.colors.qualitative.Bold
-            
-            fig_pie = go.Figure(
-                data=[
-                    go.Pie(
-                        labels=category_names,
-                        values=category_amounts,
-                        sort=False,
-                        direction='clockwise',
-                        textposition='inside',
-                        textinfo='percent+label',
-                        marker=dict(
-                            colors=pie_colors[:len(category_names)],
-                            line=dict(color='white', width=2)
-                        )
-                    )
-                ]
-            )
-            fig_pie.update_layout(
-                title="Spending Distribution",
-                showlegend=True,
-                margin=dict(t=40, l=10, r=10, b=10)
-            )
-            if PLOTLY_EVENTS_AVAILABLE:
-                selected_points = plotly_events(
-                    fig_pie,
-                    click_event=True,
-                    hover_event=False,
-                    select_event=False,
-                    key='spending_category_pie_events'
-                )
-
-                if selected_points:
-                    point_index = selected_points[0].get('pointNumber')
-                    if point_index is not None and 0 <= point_index < len(category_names):
-                        _show_category_items_modal(category_names[point_index], result['transactions'])
+            if not spending_totals:
+                st.info("No hay gastos efectivos para graficar bajo los filtros actuales.")
             else:
-                st.plotly_chart(fig_pie, use_container_width=True)
-                st.caption("Install 'streamlit-plotly-events' to enable click-to-open category modal.")
+                spending_rows = (
+                    pd.DataFrame(
+                        [{
+                            'Category': category,
+                            'Amount': float(amount)
+                        } for category, amount in spending_totals.items()]
+                    )
+                    .sort_values('Amount', ascending=False)
+                    .reset_index(drop=True)
+                )
+
+                category_names = spending_rows['Category'].tolist()
+                category_amounts = spending_rows['Amount'].tolist()
+                pie_colors = px.colors.qualitative.Set3 + px.colors.qualitative.Pastel + px.colors.qualitative.Bold
+                
+                fig_pie = go.Figure(
+                    data=[
+                        go.Pie(
+                            labels=category_names,
+                            values=category_amounts,
+                            sort=False,
+                            direction='clockwise',
+                            textposition='inside',
+                            textinfo='percent+label',
+                            marker=dict(
+                                colors=pie_colors[:len(category_names)],
+                                line=dict(color='white', width=2)
+                            )
+                        )
+                    ]
+                )
+                fig_pie.update_layout(
+                    title="Spending Distribution",
+                    showlegend=True,
+                    margin=dict(t=40, l=10, r=10, b=10)
+                )
+                if PLOTLY_EVENTS_AVAILABLE:
+                    selected_points = plotly_events(
+                        fig_pie,
+                        click_event=True,
+                        hover_event=False,
+                        select_event=False,
+                        key='spending_category_pie_events'
+                    )
+
+                    if selected_points:
+                        point_index = selected_points[0].get('pointNumber')
+                        if point_index is not None and 0 <= point_index < len(category_names):
+                            _show_category_items_modal(category_names[point_index], filtered_transactions)
+                else:
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                    st.caption("Install 'streamlit-plotly-events' to enable click-to-open category modal.")
         
         with chart_col2:
             st.subheader("📈 Category Breakdown")
             
-            # Create bar chart
-            df_categories = pd.DataFrame([
-                {
-                    'Category': cat['category'].replace('_', ' ').title(),
-                    'Amount': cat['total'],
-                    'Percentage': cat['percentage'],
-                    'Count': cat['transaction_count']
-                }
-                for cat in categories[:6]  # Top 6 categories
-            ])
-            
-            fig_bar = px.bar(
-                df_categories,
-                x='Category',
-                y='Amount', 
-                title="Top Categories by Amount",
-                text='Amount',
-                color='Percentage',
-                color_continuous_scale='Viridis'
-            )
-            fig_bar.update_traces(texttemplate='$%{text:.0f}', textposition='outside')
-            fig_bar.update_layout(showlegend=False)
-            st.plotly_chart(fig_bar, use_container_width=True)
+            filtered_debits = [
+                t for t in filtered_transactions
+                if t.get('is_debit') and t.get('effective_is_spending', True)
+            ]
+
+            if not filtered_debits:
+                st.info("No hay gastos efectivos para mostrar desglose con los filtros actuales.")
+            else:
+                totals = {}
+                counts = {}
+                for txn in filtered_debits:
+                    cat = txn.get('category', 'other')
+                    totals[cat] = totals.get(cat, 0.0) + float(txn.get('amount') or 0.0)
+                    counts[cat] = counts.get(cat, 0) + 1
+
+                total_spent_filtered = sum(totals.values())
+                rows = []
+                for cat, amount in totals.items():
+                    pct = (amount / total_spent_filtered * 100) if total_spent_filtered > 0 else 0.0
+                    rows.append({
+                        'Category': cat.replace('_', ' ').title(),
+                        'Amount': amount,
+                        'Percentage': pct,
+                        'Count': counts.get(cat, 0),
+                    })
+
+                df_categories = pd.DataFrame(rows).sort_values('Amount', ascending=False).head(6)
+                fig_bar = px.bar(
+                    df_categories,
+                    x='Category',
+                    y='Amount',
+                    title="Top Categories by Amount",
+                    text='Amount',
+                    color='Percentage',
+                    color_continuous_scale='Viridis'
+                )
+                fig_bar.update_traces(texttemplate='$%{text:.0f}', textposition='outside')
+                fig_bar.update_layout(showlegend=False)
+                st.plotly_chart(fig_bar, use_container_width=True)
 
     # Insights sections
     insight_col1, insight_col2 = st.columns(2)
@@ -1808,10 +1960,12 @@ def display_results(result: dict):
     
     # Transaction details (expandable)
     with st.expander("📋 View All Transactions", expanded=False):
-        if result['transactions']:
+        if all_transactions:
             st.caption("You can edit categories for any row. Then click 'Update report' to recalculate metrics, charts, and LLM insights.")
 
-            df_transactions = _transactions_to_editor_df(result['transactions'])
+            st.caption("Puedes editar categorías por cartola: usa el filtro Documento para revisar cada archivo por separado.")
+
+            df_transactions = _transactions_to_editor_df(filtered_transactions)
             category_labels = [_category_code_to_label(code) for code in CATEGORY_CODES if code != 'uncategorized']
 
             edited_df = st.data_editor(
@@ -1823,8 +1977,14 @@ def display_results(result: dict):
                     '_txn_index': None,
                     'Amount': st.column_config.NumberColumn('Amount', format='$%.2f', disabled=True),
                     'Date': st.column_config.TextColumn('Date', disabled=True),
+                    'Month': st.column_config.TextColumn('Month', disabled=True),
+                    'Person': st.column_config.TextColumn('Person', disabled=True),
+                    'Document': st.column_config.TextColumn('Document', disabled=True),
+                    'Doc Type': st.column_config.TextColumn('Doc Type', disabled=True),
                     'Description': st.column_config.TextColumn('Description', disabled=True),
                     'Type': st.column_config.TextColumn('Type', disabled=True),
+                    'Counts as spending': st.column_config.CheckboxColumn('Counts as spending', disabled=True),
+                    'Internal transfer?': st.column_config.CheckboxColumn('Internal transfer?', disabled=True),
                     'Confidence': st.column_config.TextColumn('Confidence', disabled=True),
                     'Source': st.column_config.TextColumn('Source', disabled=True),
                     'Category': st.column_config.SelectboxColumn('Category', options=category_labels, required=True)
@@ -1903,6 +2063,10 @@ def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
     updated_result = copy.deepcopy(result)
     updated_result['transactions'] = updated_transactions
     updated_result['analysis'] = updated_analysis
+    if hasattr(st.session_state.analyzer, 'aggregate_by_month'):
+        updated_result['monthly_summary'] = st.session_state.analyzer.aggregate_by_month(updated_transactions)
+    if hasattr(st.session_state.analyzer, 'compute_monthly_trends'):
+        updated_result['monthly_trends'] = st.session_state.analyzer.compute_monthly_trends(updated_result.get('monthly_summary', []))
     updated_result['system_metrics']['total_llm_calls'] += max(llm_added_calls, 0)
     updated_result['system_metrics']['estimated_cost'] += max(llm_added_cost, 0.0)
     updated_result['system_metrics']['processing_time'] = datetime.now().isoformat()
@@ -1923,6 +2087,19 @@ def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
 def show_debug_diagnostics(result: dict):
     """Show parser diagnostics to help troubleshoot unsupported PDF formats."""
     debug_data = result.get('document_debug') or result.get('debug_info') or {}
+
+    if isinstance(debug_data, list):
+        with st.expander("🛠️ Parser Diagnostics", expanded=False):
+            for item in debug_data:
+                st.write(f"**{item.get('file_name', item.get('document_id', 'document'))}**")
+                parsing_stats = item.get('parsing_stats')
+                lines = item.get('sample_transaction_lines', [])[:10]
+                if parsing_stats:
+                    st.json(parsing_stats)
+                if lines:
+                    for line in lines:
+                        st.code(line)
+        return
 
     parsing_stats = debug_data.get('parsing_stats') or debug_data.get('document_processing', {}).get('parsing_stats')
     lines = debug_data.get('sample_transaction_lines') or debug_data.get('document_processing', {}).get('raw_transaction_lines', [])[:10]

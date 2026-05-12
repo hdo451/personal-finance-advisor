@@ -14,8 +14,10 @@ Total system: ≤2 LLM calls per bank statement
 """
 
 import os
-from typing import Dict, Optional
+import re
+from collections import defaultdict
 from datetime import datetime
+from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
 # Import all agents
@@ -70,88 +72,123 @@ class BankStatementAnalyzer:
             Complete financial analysis results
         """
 
-        # RESET LLM counters for this analysis
+        single_statement = {
+            'pdf_path': pdf_path,
+            'metadata': {
+                'file_name': os.path.basename(pdf_path),
+                'document_type': 'bank_account',
+                'person': 'default',
+                'account_label': 'default',
+            }
+        }
+        return self.analyze_statements([single_statement], generate_ai_insights=generate_ai_insights)
+
+    def analyze_statements(self, statements: List[Dict], generate_ai_insights: bool = False) -> Dict:
+        """Analyze multiple statements deterministically and return a consolidated result."""
+        if not statements:
+            return self._create_error_response("No statements were provided for analysis")
+
+        # RESET LLM counters for this analysis batch
         self.llm.reset_counters()
         self.agent1.llm_calls_made = 0
-        self.agent2.llm_calls_made = 0  
+        self.agent2.llm_calls_made = 0
         self.agent3.llm_calls_made = 0
-        
-        print(f"🚀 ANALYZING BANK STATEMENT")
+
+        print("🚀 ANALYZING BANK STATEMENTS")
         print("=" * 50)
-        print(f"📄 File: {os.path.basename(pdf_path)}")
+        print(f"📄 Documents: {len(statements)}")
         print(f"🤖 AI insights: {'Enabled' if generate_ai_insights else 'Disabled'}")
         print(f"🕐 Started: {datetime.now().strftime('%H:%M:%S')}")
         print("")
-        
-        # DETERMINISTIC ROUTING - Step 1: Validation
-        validation_result = self._validate_input(pdf_path)
-        if not validation_result['valid']:
-            return self._create_error_response(validation_result['error'])
-        
+
+        all_transactions: List[Dict] = []
+        document_results: List[Dict] = []
+        document_debug: List[Dict] = []
+
         try:
-            # STEP 1: Agent 1 - Document Processing (0 LLM calls)
-            print("1️⃣ AGENT 1: Document Processing")
+            for index, statement in enumerate(statements, start=1):
+                pdf_path = statement.get('pdf_path', '')
+                metadata = statement.get('metadata', {}) or {}
+
+                validation_result = self._validate_input(pdf_path)
+                if not validation_result['valid']:
+                    return self._create_error_response(f"Document {index} validation failed: {validation_result['error']}")
+
+                print(f"{index}️⃣ AGENT 1: Document Processing - {os.path.basename(pdf_path)}")
+                print("-" * 30)
+                doc_result = self.agent1.process(pdf_path)
+
+                if not doc_result['success']:
+                    return self._create_error_response(
+                        f"Document processing failed for {os.path.basename(pdf_path)}: {doc_result['error']}",
+                        debug_info={'document_processing': doc_result}
+                    )
+
+                raw_transactions = doc_result.get('transactions', [])
+                if len(raw_transactions) == 0:
+                    return self._create_error_response(
+                        f"No transactions found in {os.path.basename(pdf_path)}. The statement format may need additional parsing rules.",
+                        debug_info={
+                            'parsing_stats': doc_result.get('parsing_stats', {}),
+                            'sample_transaction_lines': doc_result.get('raw_transaction_lines', [])[:10]
+                        }
+                    )
+                if len(raw_transactions) > 2000:
+                    return self._create_error_response(f"Too many transactions in {os.path.basename(pdf_path)} (>2000)")
+
+                normalized_metadata = self._build_statement_metadata(pdf_path, raw_transactions, doc_result, metadata, index)
+                normalized_transactions = self.normalize_transactions(raw_transactions, normalized_metadata)
+
+                print(f"\n{index}️⃣ AGENT 2: Smart Categorization")
+                print("-" * 30)
+                categorized_transactions = self.agent2.process(normalized_transactions)
+
+                for txn in categorized_transactions:
+                    self.classify_transaction(txn)
+
+                all_transactions.extend(categorized_transactions)
+                document_results.append({
+                    'document_id': normalized_metadata['document_id'],
+                    'metadata': normalized_metadata,
+                    'transactions': categorized_transactions,
+                })
+                document_debug.append({
+                    'document_id': normalized_metadata['document_id'],
+                    'file_name': normalized_metadata['file_name'],
+                    'parsing_stats': doc_result.get('parsing_stats', {}),
+                    'sample_transaction_lines': doc_result.get('raw_transaction_lines', [])[:10],
+                })
+
+            merged_transactions = self.merge_statements(document_results)
+            merged_transactions = self.detect_internal_transfers(merged_transactions)
+
+            print("\n3️⃣ AGENT 3: Analysis Generation")
             print("-" * 30)
-            
-            doc_result = self.agent1.process(pdf_path)
-            
-            # Deterministic routing based on Agent 1 results
-            if not doc_result['success']:
-                return self._create_error_response(
-                    f"Document processing failed: {doc_result['error']}",
-                    debug_info={'document_processing': doc_result}
-                )
-            
-            transactions = doc_result['transactions']
-            
-            # Route based on transaction count (deterministic logic)
-            if len(transactions) == 0:
-                return self._create_error_response(
-                    "No transactions found in document. The statement format may need additional parsing rules.",
-                    debug_info={
-                        'parsing_stats': doc_result.get('parsing_stats', {}),
-                        'sample_transaction_lines': doc_result.get('raw_transaction_lines', [])[:10]
-                    }
-                )
-            elif len(transactions) > 500:
-                return self._create_error_response("Too many transactions - please split file")
-            
-            print(f"   ✅ {len(transactions)} transactions processed")
-            
-            # STEP 2: Agent 2 - Smart Categorization (1 LLM call)
-            print(f"\n2️⃣ AGENT 2: Smart Categorization")
-            print("-" * 30)
-            
-            categorized_transactions = self.agent2.process(transactions)
-            
-            print(f"   ✅ All transactions categorized")
-            
-            # STEP 3: Agent 3 - Analysis Generation (0-1 LLM calls)
-            print(f"\n3️⃣ AGENT 3: Analysis Generation")
-            print("-" * 30)
-            
             final_analysis = self.agent3.process(
-                categorized_transactions, 
+                merged_transactions,
                 generate_ai_insights=generate_ai_insights
             )
-            
-            # Calculate final system metrics
-            total_llm_calls = (self.agent1.llm_calls_made + 
-                             self.agent2.llm_calls_made + 
-                             self.agent3.llm_calls_made)
-            
-            # Update session state
+
+            monthly_summary = self.aggregate_by_month(merged_transactions)
+            monthly_trends = self.compute_monthly_trends(monthly_summary)
+
+            total_llm_calls = (
+                self.agent1.llm_calls_made +
+                self.agent2.llm_calls_made +
+                self.agent3.llm_calls_made
+            )
             self._update_session_state(total_llm_calls)
-            
-            # Create comprehensive result
+
             result = {
                 'success': True,
                 'analysis': final_analysis,
-                'transactions': categorized_transactions,
-                'document_debug': {
-                    'parsing_stats': doc_result.get('parsing_stats', {}),
-                    'sample_transaction_lines': doc_result.get('raw_transaction_lines', [])[:10]
-                },
+                'transactions': merged_transactions,
+                'documents': [d['metadata'] for d in document_results],
+                'document_results': document_results,
+                'document_debug': document_debug,
+                'monthly_summary': monthly_summary,
+                'monthly_trends': monthly_trends,
+                'multi_document': len(document_results) > 1,
                 'system_metrics': {
                     'total_llm_calls': total_llm_calls,
                     'estimated_cost': self.llm.total_cost,
@@ -164,14 +201,323 @@ class BankStatementAnalyzer:
                 },
                 'session_state': self.session_state.copy()
             }
-            
+
             self._print_final_results(result)
             return result
-            
+
         except Exception as e:
             error_msg = f"System error during analysis: {str(e)}"
             print(f"❌ {error_msg}")
             return self._create_error_response(error_msg)
+
+    def _build_statement_metadata(
+        self,
+        pdf_path: str,
+        transactions: List[Dict],
+        doc_result: Dict,
+        metadata_hint: Dict,
+        index: int,
+    ) -> Dict:
+        file_name = os.path.basename(pdf_path)
+        document_type = self._detect_document_type(file_name, metadata_hint.get('document_type'))
+        min_date, max_date = self._detect_statement_date_range(transactions)
+        institution = self._detect_financial_institution(
+            doc_result.get('raw_transaction_lines', []),
+            file_name,
+            metadata_hint.get('institution')
+        )
+
+        person = (metadata_hint.get('person') or 'default').strip() or 'default'
+        account_label = (metadata_hint.get('account_label') or f"account_{index}").strip() or f"account_{index}"
+        document_id = f"doc_{index}_{re.sub(r'[^a-z0-9]+', '_', file_name.lower()).strip('_')}"
+
+        return {
+            'document_id': document_id,
+            'file_name': file_name,
+            'pdf_path': pdf_path,
+            'document_type': document_type,
+            'person': person,
+            'account_label': account_label,
+            'institution': institution,
+            'date_range': {
+                'start': min_date,
+                'end': max_date,
+            },
+            'provided_metadata': metadata_hint,
+        }
+
+    def _detect_document_type(self, file_name: str, hint: Optional[str] = None) -> str:
+        allowed = {'bank_account', 'credit_card', 'other'}
+        if hint in allowed:
+            return hint
+
+        lower = file_name.lower()
+        if any(token in lower for token in ['card', 'tarjeta', 'visa', 'mastercard', 'amex']):
+            return 'credit_card'
+        if any(token in lower for token in ['statement', 'cartola', 'checking', 'savings', 'banco']):
+            return 'bank_account'
+        return 'other'
+
+    def _detect_financial_institution(self, lines: List[str], file_name: str, hint: Optional[str] = None) -> str:
+        if hint:
+            return hint
+
+        candidates = {
+            'chase': 'Chase',
+            'wells fargo': 'Wells Fargo',
+            'bank of america': 'Bank of America',
+            'santander': 'Santander',
+            'bbva': 'BBVA',
+            'bci': 'BCI',
+            'scotiabank': 'Scotiabank',
+            'itau': 'Itaú',
+            'bancoestado': 'BancoEstado',
+        }
+        text = "\n".join(lines[:40]).lower() + "\n" + file_name.lower()
+        for key, institution in candidates.items():
+            if key in text:
+                return institution
+        return 'unknown'
+
+    def _detect_statement_date_range(self, transactions: List[Dict]) -> tuple[str, str]:
+        valid_dates = []
+        for txn in transactions:
+            date_text = str(txn.get('date') or '').strip()
+            try:
+                dt = datetime.strptime(date_text, '%Y-%m-%d')
+                valid_dates.append(dt)
+            except Exception:
+                continue
+
+        if not valid_dates:
+            return '', ''
+
+        min_date = min(valid_dates).strftime('%Y-%m-%d')
+        max_date = max(valid_dates).strftime('%Y-%m-%d')
+        return min_date, max_date
+
+    def normalize_transactions(self, raw_transactions: List[Dict], metadata: Dict) -> List[Dict]:
+        """Normalize transactions into a unified schema while preserving document traceability."""
+        normalized: List[Dict] = []
+        for idx, txn in enumerate(raw_transactions, start=1):
+            normalized_txn = dict(txn)
+            normalized_txn['source_document_id'] = metadata['document_id']
+            normalized_txn['source_file_name'] = metadata['file_name']
+            normalized_txn['document_type'] = metadata['document_type']
+            normalized_txn['person'] = metadata['person']
+            normalized_txn['account_label'] = metadata['account_label']
+            normalized_txn['institution'] = metadata['institution']
+            normalized_txn['statement_date_start'] = metadata['date_range']['start']
+            normalized_txn['statement_date_end'] = metadata['date_range']['end']
+            normalized_txn['local_txn_id'] = txn.get('transaction_id') or f"txn_{idx}"
+            normalized_txn['transaction_id'] = f"{metadata['document_id']}::{normalized_txn['local_txn_id']}"
+            normalized_txn['effective_is_spending'] = bool(txn.get('is_debit', False))
+            normalized_txn['effective_is_income'] = not bool(txn.get('is_debit', False))
+
+            date_text = str(txn.get('date') or '').strip()
+            normalized_txn['month'] = date_text[:7] if len(date_text) >= 7 else 'unknown'
+
+            normalized.append(normalized_txn)
+        return normalized
+
+    def classify_transaction(self, transaction: Dict) -> Dict:
+        """Assign deterministic movement tags, especially for credit card statements."""
+        desc = str(transaction.get('description') or '').lower()
+        is_debit = bool(transaction.get('is_debit', False))
+        doc_type = transaction.get('document_type', 'other')
+
+        movement_type = 'other'
+        if doc_type == 'credit_card':
+            if is_debit:
+                if any(k in desc for k in ['interest', 'interes', 'interés']):
+                    movement_type = 'card_interest'
+                    transaction['category'] = 'fees' if transaction.get('category') == 'uncategorized' else transaction.get('category')
+                elif any(k in desc for k in ['fee', 'cargo', 'comision', 'comisión', 'late payment', 'maintenance']):
+                    movement_type = 'card_fee'
+                    transaction['category'] = 'fees' if transaction.get('category') == 'uncategorized' else transaction.get('category')
+                else:
+                    movement_type = 'card_purchase'
+            else:
+                if any(k in desc for k in ['payment', 'pago', 'abono', 'transferencia']):
+                    movement_type = 'card_payment'
+                elif any(k in desc for k in ['refund', 'reversal', 'devolucion', 'devolución', 'credito', 'crédito']):
+                    movement_type = 'card_refund'
+                else:
+                    movement_type = 'card_credit'
+        else:
+            if is_debit and any(k in desc for k in ['payment', 'pago', 'tarjeta', 'credit card', 'tc']):
+                movement_type = 'possible_card_payment'
+            elif not is_debit and any(k in desc for k in ['salary', 'nomina', 'nómina', 'deposit', 'abono']):
+                movement_type = 'income_credit'
+            elif is_debit and transaction.get('category') == 'fees':
+                movement_type = 'bank_fee'
+            else:
+                movement_type = 'bank_movement'
+
+        transaction['movement_type'] = movement_type
+        return transaction
+
+    def merge_statements(self, statement_results: List[Dict]) -> List[Dict]:
+        """Merge already-normalized per-document transactions in deterministic order."""
+        merged = []
+        for doc in statement_results:
+            merged.extend(doc.get('transactions', []))
+
+        def sort_key(txn: Dict):
+            return (
+                str(txn.get('date') or ''),
+                str(txn.get('source_document_id') or ''),
+                str(txn.get('local_txn_id') or ''),
+            )
+
+        return sorted(merged, key=sort_key)
+
+    def detect_internal_transfers(self, transactions: List[Dict]) -> List[Dict]:
+        """Flag likely card-payment transfers to avoid double-counting household spending."""
+        card_purchases_by_person_month = defaultdict(float)
+
+        for txn in transactions:
+            if txn.get('document_type') == 'credit_card' and txn.get('movement_type') == 'card_purchase':
+                key = (txn.get('person') or 'default', txn.get('month') or 'unknown')
+                card_purchases_by_person_month[key] += float(txn.get('amount') or 0.0)
+
+        for txn in transactions:
+            txn.setdefault('possible_internal_transfer', False)
+            txn.setdefault('internal_transfer_reason', '')
+
+            desc = str(txn.get('description') or '').lower()
+            month = txn.get('month') or 'unknown'
+            person = txn.get('person') or 'default'
+
+            if txn.get('movement_type') == 'possible_card_payment' and txn.get('is_debit'):
+                paid_amount = float(txn.get('amount') or 0.0)
+                monthly_card_spend = card_purchases_by_person_month.get((person, month), 0.0)
+
+                if monthly_card_spend > 0:
+                    ratio = paid_amount / monthly_card_spend if monthly_card_spend else 0.0
+                    if 0.60 <= ratio <= 1.40:
+                        txn['possible_internal_transfer'] = True
+                        txn['internal_transfer_reason'] = (
+                            f"Possible card payment matched to card purchases for {month} "
+                            f"(payment={paid_amount:.2f}, purchases={monthly_card_spend:.2f})"
+                        )
+                        txn['effective_is_spending'] = False
+
+            if txn.get('document_type') == 'credit_card' and txn.get('movement_type') == 'card_payment' and not txn.get('is_debit'):
+                txn['possible_internal_transfer'] = True
+                txn['internal_transfer_reason'] = 'Credit card payment credit, excluded from income totals'
+                txn['effective_is_income'] = False
+
+            if any(k in desc for k in ['internal transfer', 'traspaso propio', 'between accounts']):
+                txn['possible_internal_transfer'] = True
+                txn['internal_transfer_reason'] = 'Explicit internal transfer keyword detected'
+                txn['effective_is_spending'] = False if txn.get('is_debit') else txn.get('effective_is_spending', False)
+                txn['effective_is_income'] = False if not txn.get('is_debit') else txn.get('effective_is_income', False)
+
+        return transactions
+
+    def aggregate_by_month(self, transactions: List[Dict]) -> List[Dict]:
+        monthly = {}
+        for txn in transactions:
+            month = txn.get('month') or 'unknown'
+            bucket = monthly.setdefault(month, {
+                'month': month,
+                'total_spent': 0.0,
+                'total_income': 0.0,
+                'net_change': 0.0,
+                'transaction_count': 0,
+                'spending_transactions': 0,
+                'income_transactions': 0,
+                'by_category': {},
+            })
+
+            amount = float(txn.get('amount') or 0.0)
+            category = txn.get('category') or 'other'
+            bucket['transaction_count'] += 1
+
+            if txn.get('is_debit') and txn.get('effective_is_spending', True):
+                bucket['total_spent'] += amount
+                bucket['spending_transactions'] += 1
+                bucket['by_category'][category] = bucket['by_category'].get(category, 0.0) + amount
+            elif (not txn.get('is_debit')) and txn.get('effective_is_income', True):
+                bucket['total_income'] += amount
+                bucket['income_transactions'] += 1
+
+        rows = []
+        for month in sorted(monthly.keys()):
+            row = monthly[month]
+            row['net_change'] = row['total_income'] - row['total_spent']
+            rows.append(row)
+        return rows
+
+    def compute_monthly_trends(self, monthly_summary: List[Dict], threshold: float = 0.08) -> Dict:
+        if len(monthly_summary) < 2:
+            return {
+                'classification': 'insufficient_data',
+                'threshold': threshold,
+                'changes': [],
+                'details': 'At least two months are required for trend analysis.'
+            }
+
+        changes = []
+        for idx in range(1, len(monthly_summary)):
+            prev = monthly_summary[idx - 1]
+            curr = monthly_summary[idx]
+            prev_spent = float(prev.get('total_spent') or 0.0)
+            curr_spent = float(curr.get('total_spent') or 0.0)
+            if prev_spent <= 0:
+                pct_change = 0.0
+            else:
+                pct_change = (curr_spent - prev_spent) / prev_spent
+
+            changes.append({
+                'from_month': prev.get('month'),
+                'to_month': curr.get('month'),
+                'pct_change': pct_change,
+                'direction': 'up' if pct_change > 0 else 'down' if pct_change < 0 else 'flat',
+            })
+
+        up_streak = 0
+        down_streak = 0
+        max_up_streak = 0
+        max_down_streak = 0
+        stable_count = 0
+
+        for change in changes:
+            pct = change['pct_change']
+            if pct >= threshold:
+                up_streak += 1
+                down_streak = 0
+            elif pct <= -threshold:
+                down_streak += 1
+                up_streak = 0
+            else:
+                stable_count += 1
+                up_streak = 0
+                down_streak = 0
+
+            max_up_streak = max(max_up_streak, up_streak)
+            max_down_streak = max(max_down_streak, down_streak)
+
+        if max_up_streak >= 2:
+            classification = 'uptrend'
+            details = f'Spending increased by more than {threshold*100:.1f}% for at least two consecutive month-over-month intervals.'
+        elif max_down_streak >= 2:
+            classification = 'downtrend'
+            details = f'Spending decreased by more than {threshold*100:.1f}% for at least two consecutive month-over-month intervals.'
+        elif stable_count == len(changes):
+            classification = 'stable'
+            details = 'Month-over-month spending stayed within the configured variation range.'
+        else:
+            classification = 'irregular'
+            details = 'High variation exists without a consistent directional pattern.'
+
+        return {
+            'classification': classification,
+            'threshold': threshold,
+            'changes': changes,
+            'details': details,
+        }
     
     def _validate_input(self, pdf_path: str) -> Dict:
         """Deterministic input validation"""

@@ -75,8 +75,8 @@ class AnalysisGeneratorAgent(BaseAgent):
         print("   💰 Calculating financial summary...")
         
         # Separate debits and credits
-        debits = [t for t in transactions if t['is_debit']]
-        credits = [t for t in transactions if not t['is_debit']]
+        debits = [t for t in transactions if self._is_spending_debit(t)]
+        credits = [t for t in transactions if self._is_income_credit(t)]
         
         # Calculate totals
         total_spent = sum(t['amount'] for t in debits)
@@ -103,7 +103,7 @@ class AnalysisGeneratorAgent(BaseAgent):
         print("   🏷️ Analyzing spending by category...")
         
         # Only analyze debit transactions (money going out)
-        debit_transactions = [t for t in transactions if t['is_debit']]
+        debit_transactions = [t for t in transactions if self._is_spending_debit(t)]
         total_spent = sum(t['amount'] for t in debit_transactions)
         
         # Group by category
@@ -150,7 +150,7 @@ class AnalysisGeneratorAgent(BaseAgent):
         """Identify interesting spending patterns (deterministic)"""
         print("   🔍 Identifying spending patterns...")
         
-        debit_transactions = [t for t in transactions if t['is_debit']]
+        debit_transactions = [t for t in transactions if self._is_spending_debit(t)]
         
         if not debit_transactions:
             return {}
@@ -185,6 +185,12 @@ class AnalysisGeneratorAgent(BaseAgent):
             'unique_merchants': len(merchant_totals),
             'average_transactions_per_day': len(debit_transactions) / 30
         }
+
+    def _is_spending_debit(self, transaction: Dict) -> bool:
+        return bool(transaction.get('is_debit')) and bool(transaction.get('effective_is_spending', True))
+
+    def _is_income_credit(self, transaction: Dict) -> bool:
+        return (not bool(transaction.get('is_debit'))) and bool(transaction.get('effective_is_income', True))
     
     def _generate_basic_insights(self, summary: Dict, category_analysis: List[Dict]) -> List[str]:
         """Generate template-based insights (deterministic)"""
