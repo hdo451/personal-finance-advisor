@@ -1,8 +1,6 @@
 import os
 from typing import Dict, Optional
 
-from openai import OpenAI
-
 
 def resolve_openai_api_key() -> Optional[str]:
     """Resolve the OpenAI key from Streamlit Secrets first, then environment variables.
@@ -30,6 +28,8 @@ class LLMInterface:
     """
 
     def __init__(self, api_key: str):
+        from openai import OpenAI
+
         self.client = OpenAI(api_key=api_key)
         self.call_count = 0    # Track total calls
         self.total_cost = 0.0  # Track estimated cost
