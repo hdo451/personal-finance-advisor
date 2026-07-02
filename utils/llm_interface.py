@@ -1,5 +1,27 @@
-from openai import OpenAI
+import os
 from typing import Dict, Optional
+
+from openai import OpenAI
+
+
+def resolve_openai_api_key() -> Optional[str]:
+    """Resolve the OpenAI key from Streamlit Secrets first, then environment variables.
+
+    This keeps local development and Streamlit Cloud aligned without forcing the caller
+    to know where the secret is stored.
+    """
+    try:
+        import streamlit as st  # Local import so non-Streamlit code can still use this helper.
+
+        if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
+            key = str(st.secrets["OPENAI_API_KEY"]).strip()
+            if key:
+                return key
+    except Exception:
+        pass
+
+    key = os.getenv("OPENAI_API_KEY")
+    return key.strip() if key else None
 
 class LLMInterface:
     """

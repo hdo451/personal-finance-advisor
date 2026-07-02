@@ -13,6 +13,7 @@ import os
 from typing import Any
 from dotenv import load_dotenv
 from openai import OpenAI
+from utils.llm_interface import resolve_openai_api_key
 
 load_dotenv()
 
@@ -39,9 +40,9 @@ class LLMProblemParser:
     
     def __init__(self):
         """Inicializa el cliente de OpenAI."""
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = resolve_openai_api_key()
         if not api_key:
-            raise ValueError("OPENAI_API_KEY no está configurada en .env")
+            raise ValueError("OPENAI_API_KEY no está configurada en Streamlit Secrets ni en el entorno local")
         self.client = OpenAI(api_key=api_key)
     
     def parse_problem(self, problem_statement: str, problem_focus: str | None = None) -> dict[str, Any]:

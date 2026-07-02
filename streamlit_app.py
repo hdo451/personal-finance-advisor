@@ -14,6 +14,7 @@ import pandas as pd
 from datetime import datetime, date
 import os
 import copy
+import tempfile
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
@@ -28,6 +29,7 @@ except ImportError:
 # Import your system
 from main_coordinator import BankStatementAnalyzer
 from utils.financial_solver import solve_problem
+from utils.llm_interface import resolve_openai_api_key
 
 KNOWLEDGE_BASE_PATH = Path(__file__).resolve().parent / "data" / "advisory_knowledge_base_v1.json"
 
@@ -232,14 +234,7 @@ def _get_openai_api_key() -> Optional[str]:
 
     Streamlit Cloud should store the key in Secrets. Local development can still use .env.
     """
-    try:
-        if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
-            return str(st.secrets["OPENAI_API_KEY"]).strip() or None
-    except Exception:
-        pass
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    return api_key.strip() if api_key else None
+    return resolve_openai_api_key()
 
 
 @st.cache_data(show_spinner=False)
@@ -286,6 +281,16 @@ def _build_meta_analysis_payload(result: dict) -> dict:
             for txn in result['transactions']
         ]
     }
+
+
+def _redact_diagnostic_line(line: str) -> str:
+    redacted = str(line or "").strip()
+    redacted = re.sub(r'\b\d{4,}\b', '[redacted]', redacted)
+    redacted = re.sub(r'(?i)(\$\s*)?\d{1,3}(?:[\.,]\d{3})*(?:[\.,]\d{2})', '[amount redacted]', redacted)
+    redacted = re.sub(r'\s+', ' ', redacted)
+    if len(redacted) > 120:
+        redacted = redacted[:117] + '...'
+    return redacted
 
 
 def _run_meta_analysis(result: dict) -> dict:
@@ -1734,9 +1739,12 @@ def process_uploaded_files(statement_inputs: list, generate_insights: bool):
         statements_for_analysis = []
         for idx, statement in enumerate(statement_inputs, start=1):
             uploaded_file = statement['uploaded_file']
-            temp_path = f"temp_{idx}_{uploaded_file.name}"
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+            safe_name = Path(uploaded_file.name).name or f"statement_{idx}.pdf"
+            suffix = Path(safe_name).suffix or ".pdf"
+            prefix = re.sub(r'[^A-Za-z0-9_-]+', '_', Path(safe_name).stem)[:30] or f"statement_{idx}"
+            with tempfile.NamedTemporaryFile(prefix=f"{prefix}_{idx}_", suffix=suffix, delete=False) as temp_file:
+                temp_file.write(uploaded_file.getbuffer())
+                temp_path = temp_file.name
             temp_paths.append(temp_path)
 
             statements_for_analysis.append({
@@ -2205,7 +2213,7 @@ def show_debug_diagnostics(result: dict):
                     st.json(parsing_stats)
                 if lines:
                     for line in lines:
-                        st.code(line)
+                        st.code(_redact_diagnostic_line(line))
         return
 
     parsing_stats = debug_data.get('parsing_stats') or debug_data.get('document_processing', {}).get('parsing_stats')
@@ -2222,7 +2230,7 @@ def show_debug_diagnostics(result: dict):
         if lines:
             st.write("**Detected transaction-like lines (sample)**")
             for line in lines:
-                st.code(line)
+                st.code(_redact_diagnostic_line(line))
 
 if __name__ == "__main__":
     main()
