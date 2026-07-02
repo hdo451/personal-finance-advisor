@@ -1626,7 +1626,20 @@ def main():
     
     # Sidebar - System Information
     with st.sidebar:
-        st.header("🤖 System Status")
+        st.markdown(
+            """
+            <div style="display:flex; align-items:center; gap:12px; margin:0.2rem 0 1rem 0;">
+                <div style="font-size:2.2rem; font-weight:900; line-height:1; letter-spacing:-0.06em; color:#203A6B;">
+                    h<span style="color:#F0B429;">w</span><span style="color:#2CA36A;">a</span>
+                </div>
+                <div style="line-height:1.05;">
+                    <div style="font-size:1.15rem; font-weight:700; color:#203A6B;">Hispanic Wealth</div>
+                    <div style="font-size:1.1rem; font-style:italic; color:#2CA36A;">Advisors<sup style="font-size:0.55em; vertical-align:super;">SM</sup></div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         st.divider()
         workspace_mode = st.radio(
