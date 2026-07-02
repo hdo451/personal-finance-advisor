@@ -11,7 +11,7 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
 import os
 import copy
 from pathlib import Path
@@ -77,7 +77,40 @@ def _transactions_to_editor_df(transactions: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _filter_transactions(transactions: list, person_filter: str, month_filter: str, document_filter: str) -> list:
+def _parse_transaction_date(date_text: str) -> Optional[date]:
+    date_text = str(date_text or '').strip()
+    if not date_text:
+        return None
+
+    date_formats = [
+        '%Y-%m-%d',
+        '%Y/%m/%d',
+        '%d/%m/%Y',
+        '%m/%d/%Y',
+        '%d-%m-%Y',
+        '%m-%d-%Y',
+    ]
+
+    for fmt in date_formats:
+        try:
+            return datetime.strptime(date_text, fmt).date()
+        except Exception:
+            continue
+
+    try:
+        return datetime.fromisoformat(date_text).date()
+    except Exception:
+        return None
+
+
+def _filter_transactions(
+    transactions: list,
+    person_filter: str,
+    month_filter: str,
+    document_filter: str,
+    date_filter_mode: str = "Todos",
+    date_range: Optional[tuple[Optional[date], Optional[date]]] = None,
+) -> list:
     filtered = []
     for idx, txn in enumerate(transactions):
         if person_filter != "Todos" and txn.get('person') != person_filter:
@@ -87,10 +120,42 @@ def _filter_transactions(transactions: list, person_filter: str, month_filter: s
         if document_filter != "Todos" and txn.get('source_file_name') != document_filter:
             continue
 
+        txn_date = _parse_transaction_date(txn.get('date'))
+        if date_filter_mode == "Rango de fechas":
+            start_date, end_date = date_range or (None, None)
+            if txn_date is None or start_date is None or end_date is None:
+                continue
+            if not (start_date <= txn_date <= end_date):
+                continue
+
         enriched = dict(txn)
         enriched['_global_index'] = idx
         filtered.append(enriched)
     return filtered
+
+
+def _summarize_transactions(transactions: list) -> dict:
+    total_income = 0.0
+    total_spent = 0.0
+    credit_count = 0
+    debit_count = 0
+
+    for txn in transactions:
+        amount = float(txn.get('amount') or 0.0)
+        if txn.get('is_debit'):
+            total_spent += amount
+            debit_count += 1
+        else:
+            total_income += amount
+            credit_count += 1
+
+    return {
+        'total_spent': total_spent,
+        'total_income': total_income,
+        'net_change': total_income - total_spent,
+        'debit_count': debit_count,
+        'credit_count': credit_count,
+    }
 
 
 def _build_statement_inputs_from_uploads(uploaded_files: list) -> list:
@@ -1584,10 +1649,10 @@ def main():
             
             # Project info
             st.subheader("Project Details")
-            st.write("Aiadvisor, AI-driven financial advisor leveraging agent-based architecture and machine learning")
+            st.write("AI Advisor, an AI-driven financial advisor leveraging agent-based architecture and machine learning")
             st.write("**Type**: Hybrid Multi-Agent System")
             st.caption("All responses must be validated by experts.")
-            st.caption("Artifitial intellillence may not be accurate.")
+            st.caption("Artificial intelligence may not be accurate.")
             st.write("**Efficiency**: ≤2 LLM calls per analysis")
             
         else:
@@ -1759,19 +1824,57 @@ def display_results(result: dict):
     available_persons = sorted({t.get('person', '') for t in all_transactions if t.get('person')})
     available_months = sorted({t.get('month', '') for t in all_transactions if t.get('month')})
     available_docs = sorted({t.get('source_file_name', '') for t in all_transactions if t.get('source_file_name')})
+    parsed_dates = [
+        parsed_date
+        for parsed_date in (_parse_transaction_date(t.get('date')) for t in all_transactions)
+        if parsed_date is not None
+    ]
+    default_start_date = min(parsed_dates) if parsed_dates else date.today()
+    default_end_date = max(parsed_dates) if parsed_dates else date.today()
 
     filter_col1, filter_col2, filter_col3 = st.columns(3)
     with filter_col1:
         person_filter = st.selectbox("Persona", ["Todos"] + available_persons, key="results_filter_person")
     with filter_col2:
-        month_filter = st.selectbox("Mes", ["Todos"] + available_months, key="results_filter_month")
-    with filter_col3:
         document_filter = st.selectbox("Documento", ["Todos"] + available_docs, key="results_filter_document")
+    with filter_col3:
+        period_mode = st.selectbox(
+            "Periodo",
+            ["Todos", "Mes", "Rango de fechas"],
+            key="results_filter_period_mode",
+        )
 
-    filtered_transactions = _filter_transactions(all_transactions, person_filter, month_filter, document_filter)
+    month_filter = "Todos"
+    date_range = None
+    if period_mode == "Mes":
+        month_filter = st.selectbox("Mes", ["Todos"] + available_months, key="results_filter_month")
+    elif period_mode == "Rango de fechas":
+        selected_range = st.date_input(
+            "Rango de fechas",
+            value=(default_start_date, default_end_date),
+            min_value=default_start_date,
+            max_value=default_end_date,
+            key="results_filter_date_range",
+        )
+        if isinstance(selected_range, tuple) and len(selected_range) == 2:
+            start_date, end_date = selected_range
+            if start_date > end_date:
+                st.warning("La fecha inicial no puede ser posterior a la fecha final.")
+            else:
+                date_range = (start_date, end_date)
+
+    filtered_transactions = _filter_transactions(
+        all_transactions,
+        person_filter,
+        month_filter,
+        document_filter,
+        date_filter_mode=period_mode,
+        date_range=date_range,
+    )
     if not filtered_transactions and all_transactions:
         st.warning("No hay transacciones para la combinación de filtros seleccionada.")
-        filtered_transactions = all_transactions
+
+    visible_summary = _summarize_transactions(filtered_transactions)
     
     # Key metrics in cards
     col1, col2, col3, col4 = st.columns(4)
@@ -1779,19 +1882,19 @@ def display_results(result: dict):
     with col1:
         st.metric(
             "💰 Total Spent",
-            f"${summary['total_spent']:.2f}",
-            delta=f"{summary['debit_count']} transactions"
+            f"${visible_summary['total_spent']:.2f}",
+            delta=f"{visible_summary['debit_count']} transactions"
         )
     
     with col2:
         st.metric(
             "💵 Total Income", 
-            f"${summary['total_income']:.2f}",
-            delta=f"{summary['credit_count']} deposits"
+            f"${visible_summary['total_income']:.2f}",
+            delta=f"{visible_summary['credit_count']} deposits"
         )
     
     with col3:
-        net_change = summary['net_change']
+        net_change = visible_summary['net_change']
         st.metric(
             "📊 Net Change",
             f"${net_change:.2f}",
@@ -1808,13 +1911,14 @@ def display_results(result: dict):
 
     st.caption(
         f"Transacciones visibles: {len(filtered_transactions)} / {len(all_transactions)} "
-        f"(filtros aplicados por persona/mes/documento)"
+        f"(filtros aplicados por persona/documento/periodo)"
     )
 
-    monthly_summary = result.get('monthly_summary', [])
-    monthly_trends = result.get('monthly_trends', {})
+    analyzer = st.session_state.get('analyzer')
+    monthly_summary = analyzer.aggregate_by_month(filtered_transactions) if analyzer and filtered_transactions else []
+    monthly_trends = analyzer.compute_monthly_trends(monthly_summary) if analyzer and monthly_summary else {}
     if monthly_summary:
-        st.subheader("🗓️ Monthly Consolidation")
+        st.subheader("🗓️ Monthly Consolidation (visible period)")
         month_df = pd.DataFrame(monthly_summary)
         if not month_df.empty:
             st.dataframe(
@@ -1963,36 +2067,39 @@ def display_results(result: dict):
         if all_transactions:
             st.caption("You can edit categories for any row. Then click 'Update report' to recalculate metrics, charts, and LLM insights.")
 
-            st.caption("Puedes editar categorías por cartola: usa el filtro Documento para revisar cada archivo por separado.")
+            st.caption("Puedes editar categorías por cartola: usa el filtro Documento para revisar cada archivo por separado. Los filtros de periodo solo cambian lo que ves.")
 
-            df_transactions = _transactions_to_editor_df(filtered_transactions)
-            category_labels = [_category_code_to_label(code) for code in CATEGORY_CODES if code != 'uncategorized']
+            if filtered_transactions:
+                df_transactions = _transactions_to_editor_df(filtered_transactions)
+                category_labels = [_category_code_to_label(code) for code in CATEGORY_CODES if code != 'uncategorized']
 
-            edited_df = st.data_editor(
-                df_transactions,
-                use_container_width=True,
-                hide_index=True,
-                key='transactions_editor',
-                column_config={
-                    '_txn_index': None,
-                    'Amount': st.column_config.NumberColumn('Amount', format='$%.2f', disabled=True),
-                    'Date': st.column_config.TextColumn('Date', disabled=True),
-                    'Month': st.column_config.TextColumn('Month', disabled=True),
-                    'Person': st.column_config.TextColumn('Person', disabled=True),
-                    'Document': st.column_config.TextColumn('Document', disabled=True),
-                    'Doc Type': st.column_config.TextColumn('Doc Type', disabled=True),
-                    'Description': st.column_config.TextColumn('Description', disabled=True),
-                    'Type': st.column_config.TextColumn('Type', disabled=True),
-                    'Counts as spending': st.column_config.CheckboxColumn('Counts as spending', disabled=True),
-                    'Internal transfer?': st.column_config.CheckboxColumn('Internal transfer?', disabled=True),
-                    'Confidence': st.column_config.TextColumn('Confidence', disabled=True),
-                    'Source': st.column_config.TextColumn('Source', disabled=True),
-                    'Category': st.column_config.SelectboxColumn('Category', options=category_labels, required=True)
-                }
-            )
+                edited_df = st.data_editor(
+                    df_transactions,
+                    use_container_width=True,
+                    hide_index=True,
+                    key='transactions_editor',
+                    column_config={
+                        '_txn_index': None,
+                        'Amount': st.column_config.NumberColumn('Amount', format='$%.2f', disabled=True),
+                        'Date': st.column_config.TextColumn('Date', disabled=True),
+                        'Month': st.column_config.TextColumn('Month', disabled=True),
+                        'Person': st.column_config.TextColumn('Person', disabled=True),
+                        'Document': st.column_config.TextColumn('Document', disabled=True),
+                        'Doc Type': st.column_config.TextColumn('Doc Type', disabled=True),
+                        'Description': st.column_config.TextColumn('Description', disabled=True),
+                        'Type': st.column_config.TextColumn('Type', disabled=True),
+                        'Counts as spending': st.column_config.CheckboxColumn('Counts as spending', disabled=True),
+                        'Internal transfer?': st.column_config.CheckboxColumn('Internal transfer?', disabled=True),
+                        'Confidence': st.column_config.TextColumn('Confidence', disabled=True),
+                        'Source': st.column_config.TextColumn('Source', disabled=True),
+                        'Category': st.column_config.SelectboxColumn('Category', options=category_labels, required=True)
+                    }
+                )
 
-            if st.button("🔄 Update report with manual categories", type="secondary", use_container_width=True):
-                _apply_manual_category_updates(result, edited_df)
+                if st.button("🔄 Update report with manual categories", type="secondary", use_container_width=True):
+                    _apply_manual_category_updates(result, edited_df)
+            else:
+                st.info("No hay transacciones que coincidan con los filtros actuales.")
 
     st.divider()
     st.subheader("🧠 Meta Analysis")
