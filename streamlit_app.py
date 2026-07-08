@@ -161,54 +161,19 @@ def _summarize_transactions(transactions: list) -> dict:
 
 
 def _build_statement_inputs_from_uploads(uploaded_files: list) -> list:
-    """Capture deterministic per-document metadata from the user before analysis."""
+    """Build deterministic per-document metadata without rendering UI controls."""
     statement_inputs = []
 
-    st.subheader("🗂️ Metadata por documento")
-    st.caption("Estos campos ayudan a consolidar múltiples cartolas con trazabilidad. Si no estás seguro, deja valores por defecto.")
-
     for idx, uploaded_file in enumerate(uploaded_files, start=1):
-        with st.expander(f"Documento {idx}: {uploaded_file.name}", expanded=(idx <= 2)):
-            col1, col2 = st.columns(2)
-            with col1:
-                document_type = st.selectbox(
-                    "Tipo de documento",
-                    ["bank_account", "credit_card", "other"],
-                    index=0,
-                    key=f"meta_doc_type_{idx}",
-                    format_func=lambda x: {
-                        "bank_account": "Cuenta bancaria",
-                        "credit_card": "Tarjeta de crédito",
-                        "other": "Otro",
-                    }.get(x, x),
-                )
-                person = st.text_input(
-                    "Persona asociada",
-                    value=f"persona_{idx}",
-                    key=f"meta_person_{idx}",
-                    help="Ejemplo: marido, mujer, conjunta, hijo, etc.",
-                ).strip() or f"persona_{idx}"
-            with col2:
-                account_label = st.text_input(
-                    "Etiqueta de cuenta",
-                    value=f"cuenta_{idx}",
-                    key=f"meta_account_{idx}",
-                    help="Ejemplo: cuenta corriente BCI, tarjeta visa banco X",
-                ).strip() or f"cuenta_{idx}"
-                institution = st.text_input(
-                    "Institución (opcional)",
-                    value="",
-                    key=f"meta_institution_{idx}",
-                ).strip()
-
+        # Keep per-file metadata for internal traceability, but do not expose editing in the UI.
             statement_inputs.append({
                 'uploaded_file': uploaded_file,
                 'metadata': {
                     'file_name': uploaded_file.name,
-                    'document_type': document_type,
-                    'person': person,
-                    'account_label': account_label,
-                    'institution': institution,
+                'document_type': 'bank_account',
+                'person': f'persona_{idx}',
+                'account_label': f'cuenta_{idx}',
+                'institution': '',
                 }
             })
 
@@ -1620,20 +1585,24 @@ def main():
     st.warning("⚠️ **Solo para fines educativos** - No lo uses con datos financieros reales que contengan información sensible")
 
     with st.sidebar:
-        st.markdown(
-            """
-            <div style="display:flex; align-items:center; gap:12px; margin:0.2rem 0 1rem 0;">
-                <div style="font-size:2.2rem; font-weight:900; line-height:1; letter-spacing:-0.06em; color:#203A6B;">
-                    h<span style="color:#F0B429;">w</span><span style="color:#2CA36A;">a</span>
+        logo_path = Path(__file__).resolve().parent / "HispanicWealth_IMAGE.png"
+        if logo_path.exists():
+            st.image(str(logo_path), width=260)
+        else:
+            st.markdown(
+                """
+                <div style="display:flex; align-items:center; gap:12px; margin:0.2rem 0 1rem 0;">
+                    <div style="font-size:2.2rem; font-weight:900; line-height:1; letter-spacing:-0.06em; color:#203A6B;">
+                        h<span style="color:#F0B429;">w</span><span style="color:#2CA36A;">a</span>
+                    </div>
+                    <div style="line-height:1.05;">
+                        <div style="font-size:1.15rem; font-weight:700; color:#203A6B;">Hispanic Wealth</div>
+                        <div style="font-size:1.1rem; font-style:italic; color:#2CA36A;">Advisors<sup style="font-size:0.55em; vertical-align:super;">SM</sup></div>
+                    </div>
                 </div>
-                <div style="line-height:1.05;">
-                    <div style="font-size:1.15rem; font-weight:700; color:#203A6B;">Hispanic Wealth</div>
-                    <div style="font-size:1.1rem; font-style:italic; color:#2CA36A;">Advisors<sup style="font-size:0.55em; vertical-align:super;">SM</sup></div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+                """,
+                unsafe_allow_html=True,
+            )
 
         st.divider()
         workspace_mode = st.radio(
