@@ -1,4 +1,5 @@
 __pycache__/
 *.log
 .env
+.streamlit/secrets.toml
 .DS_Store

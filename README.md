@@ -182,6 +182,11 @@ Example secret format in Streamlit Cloud:
 OPENAI_API_KEY = "your_key_here"
 ```
 
+Local alternative for Streamlit secrets:
+1. Create `.streamlit/secrets.toml` if you want to mirror Cloud locally.
+2. Put the same `OPENAI_API_KEY` entry there.
+3. Keep that file out of Git; only `.streamlit/secrets.toml.example` should be shared.
+
 ### First Analysis
 1. Open browser to `http://localhost:8501`
 2. Use the sidebar to choose between `Análisis de cartola` and `Problemas cotidianos`
