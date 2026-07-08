@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 from agents.document_processor import DocumentProcessorAgent
 from agents.content_analyzer import ContentAnalyzerAgent
 from agents.analysis_generator import AnalysisGeneratorAgent
-from utils.llm_interface import LLMInterface
+from utils.llm_interface import LLMInterface, resolve_openai_api_key
 
 class BankStatementAnalyzer:
     """
@@ -607,10 +607,10 @@ def main_cli():
     
     # Load API key
     load_dotenv()
-    api_key = os.getenv('OPENAI_API_KEY')
+    api_key = resolve_openai_api_key()
     
     if not api_key:
-        print("❌ Please set OPENAI_API_KEY in .env file")
+        print("❌ Please set OPENAI_API_KEY in .env file or Streamlit Secrets")
         return
     
     # Initialize system
