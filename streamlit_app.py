@@ -1346,7 +1346,7 @@ def _generate_executive_summary(result: dict, income: float, expenses: float, sa
 
 
 def _render_meta_analysis_result(meta_state: dict):
-    st.subheader("🧠 Meta Analysis Report")
+    st.subheader("🧠 Informe de meta análisis")
     metrics = meta_state['metrics']
     result = meta_state['result']
     
@@ -1605,26 +1605,20 @@ def initialize_session_state():
 
 def main():
     """Main Streamlit application"""
-    
-    # Page configuration
+
     st.set_page_config(
-        page_title="Bank Statement Analyzer",
+        page_title="Analizador de cartolas",
         page_icon="🏦",
         layout="wide",
-        initial_sidebar_state="expanded"
+        initial_sidebar_state="expanded",
     )
-    
-    # Initialize session
+
     initialize_session_state()
-    
-    # Main header
-    st.title("🏦 Bank Statement Analyzer")
-    st.subheader("Hybrid Multi-Agent Financial Analysis System")
-    
-    # Educational warning
-    st.warning("⚠️ **Educational Project Only** - Do not use with real financial data containing sensitive information")
-    
-    # Sidebar - System Information
+
+    st.title("🏦 Analizador de cartolas")
+    st.subheader("Sistema híbrido de análisis financiero multiagente")
+    st.warning("⚠️ **Solo para fines educativos** - No lo uses con datos financieros reales que contengan información sensible")
+
     with st.sidebar:
         st.markdown(
             """
@@ -1646,56 +1640,46 @@ def main():
             "Módulo",
             ["Análisis de cartola", "Problemas cotidianos"],
             index=0,
-            help="Selecciona entre análisis de estados de cuenta y resolución de problemas financieros cotidianos"
+            help="Selecciona entre análisis de estados de cuenta y resolución de problemas financieros cotidianos",
         )
-        
+
         if st.session_state.analyzer:
-            st.success("✅ All agents initialized")
-            
-            # Agent information
-            st.subheader("Agent Architecture")
-            st.write("🏗️ **Agent 1**: Document Processor")
-            st.caption("Extracts & parses PDF (0 LLM calls)")
-            
-            st.write("🧠 **Agent 2**: Content Analyzer") 
-            st.caption("Smart categorization (1 LLM call)")
-            
-            st.write("📊 **Agent 3**: Analysis Generator")
-            st.caption("Financial insights (0-1 LLM calls)")
-            
+            st.success("✅ Todos los agentes están inicializados")
+            st.subheader("Arquitectura de agentes")
+            st.write("🏗️ **Agente 1**: Procesador de documentos")
+            st.caption("Extrae y analiza PDF (0 llamadas LLM)")
+            st.write("🧠 **Agente 2**: Analizador de contenido")
+            st.caption("Categorización inteligente (1 llamada LLM)")
+            st.write("📊 **Agente 3**: Generador de análisis")
+            st.caption("Hallazgos financieros (0-1 llamadas LLM)")
             st.divider()
-            
-            # Project info
-            st.subheader("Project Details")
-            st.write("AI Advisor, an AI-driven financial advisor leveraging agent-based architecture and machine learning")
-            st.write("**Type**: Hybrid Multi-Agent System")
-            st.caption("All responses must be validated by experts.")
-            st.caption("Artificial intelligence may not be accurate.")
-            st.write("**Efficiency**: ≤2 LLM calls per analysis")
-            
+            st.subheader("Detalles del proyecto")
+            st.write("Asesor financiero impulsado por IA con arquitectura basada en agentes y aprendizaje automático")
+            st.write("**Tipo**: Sistema híbrido multiagente")
+            st.caption("Todas las respuestas deben ser validadas por expertos.")
+            st.caption("La inteligencia artificial puede no ser precisa.")
+            st.write("**Eficiencia**: ≤2 llamadas LLM por análisis")
         else:
-            st.error("❌ System initialization failed")
-            st.write("Please check your .env file contains OPENAI_API_KEY")
-    
-    # Main content area
+            st.error("❌ Falló la inicialización del sistema")
+            st.write("Verifica que tu archivo .env contenga OPENAI_API_KEY")
+
     if workspace_mode == "Problemas cotidianos":
         render_problem_solver_page()
         return
 
     if not st.session_state.analyzer:
-        st.error("System not initialized. Please check your API key configuration.")
+        st.error("El sistema no está inicializado. Verifica la configuración de tu clave API.")
         return
-    
-    # File upload section
-    st.header("📄 Upload Bank Statements")
-    
+
+    st.header("📄 Sube tus cartolas bancarias")
+
     uploaded_files = st.file_uploader(
-        "Choose one or more bank statement PDF files",
+        "Elige uno o más archivos PDF de cartolas bancarias",
         type=['pdf'],
         accept_multiple_files=True,
-        help="Upload one or many statements/cartolas for consolidated analysis"
+        help="Sube una o varias cartolas para un análisis consolidado",
     )
-    
+
     if uploaded_files:
         st.info(f"📦 **Archivos seleccionados**: {len(uploaded_files)}")
         for up in uploaded_files:
@@ -1703,44 +1687,36 @@ def main():
 
         statement_inputs = _build_statement_inputs_from_uploads(uploaded_files)
 
-        # Analysis options
         col1, col2 = st.columns(2)
-        
+
         with col1:
             generate_insights = st.checkbox(
-                "🤖 Generate AI Insights",
+                "🤖 Generar hallazgos con IA",
                 value=False,
-                help="Use additional LLM call for personalized financial recommendations"
+                help="Usa una llamada LLM adicional para recomendaciones financieras personalizadas",
             )
-        
+
         with col2:
             if generate_insights:
                 st.info("📊 Se usarán llamadas LLM adicionales para recomendaciones")
             else:
                 st.info("📊 Modo determinístico + categorización mínima con LLM")
-        
-        # Analysis button
-        if st.button("🚀 Analyze Statements", type="primary", use_container_width=True):
+
+        if st.button("🚀 Analizar cartolas", type="primary", use_container_width=True):
             process_uploaded_files(statement_inputs, generate_insights)
 
         if st.session_state.analysis_result:
             show_debug_diagnostics(st.session_state.analysis_result)
             display_results(st.session_state.analysis_result)
-    
     else:
-        # Instructions when no file uploaded
-        st.info("👆 Please upload a bank statement PDF to begin analysis")
-        
-        # Sample files section
-        st.subheader("📋 Sample Files Available")
-        st.write("You can test with these sample bank statements:")
-        
+        st.info("👆 Sube un PDF de cartola bancaria para comenzar el análisis")
+        st.subheader("📋 Archivos de ejemplo disponibles")
+        st.write("Puedes probar con estas cartolas de ejemplo:")
         sample_files = [
-            "chase_statement.pdf - Chase Bank format",
-            "Sample Bank Statement.pdf - Generic format", 
-            "Wells Fargo Statement.pdf - Wells Fargo format"
+            "chase_statement.pdf - formato Chase Bank",
+            "Sample Bank Statement.pdf - formato genérico",
+            "Wells Fargo Statement.pdf - formato Wells Fargo",
         ]
-        
         for sample in sample_files:
             st.write(f"• {sample}")
 
@@ -1768,39 +1744,39 @@ def process_uploaded_files(statement_inputs: list, generate_insights: bool):
         progress_container = st.container()
 
         with progress_container:
-            st.subheader("🔄 Processing Pipeline")
+            st.subheader("🔄 Flujo de procesamiento")
             progress_bar = st.progress(0)
             status_text = st.empty()
 
             agent_cols = st.columns(3)
             with agent_cols[0]:
                 agent1_status = st.empty()
-                agent1_status.info("🏗️ Agent 1: Waiting...")
+                agent1_status.info("🏗️ Agente 1: esperando...")
 
             with agent_cols[1]:
                 agent2_status = st.empty()
-                agent2_status.info("🧠 Agent 2: Waiting...")
+                agent2_status.info("🧠 Agente 2: esperando...")
 
             with agent_cols[2]:
                 agent3_status = st.empty()
-                agent3_status.info("📊 Agent 3: Waiting...")
+                agent3_status.info("📊 Agente 3: esperando...")
 
-            status_text.text("🏗️ Agent 1: Processing PDFs...")
-            agent1_status.warning("🏗️ Agent 1: Processing documents...")
+            status_text.text("🏗️ Agente 1: procesando PDFs...")
+            agent1_status.warning("🏗️ Agente 1: procesando documentos...")
             progress_bar.progress(20)
 
-            status_text.text("🧠 Agent 2: Smart categorization...")
-            agent1_status.success("🏗️ Agent 1: ✅ Complete")
-            agent2_status.warning("🧠 Agent 2: Categorizing...")
+            status_text.text("🧠 Agente 2: categorización inteligente...")
+            agent1_status.success("🏗️ Agente 1: ✅ completado")
+            agent2_status.warning("🧠 Agente 2: categorizando...")
             progress_bar.progress(60)
 
             if generate_insights:
-                status_text.text("📊 Agent 3: Generating AI insights...")
+                status_text.text("📊 Agente 3: generando hallazgos con IA...")
             else:
-                status_text.text("📊 Agent 3: Generating deterministic analysis...")
+                status_text.text("📊 Agente 3: generando análisis determinista...")
 
-            agent2_status.success("🧠 Agent 2: ✅ Complete")
-            agent3_status.warning("📊 Agent 3: Analyzing...")
+            agent2_status.success("🧠 Agente 2: ✅ completado")
+            agent3_status.warning("📊 Agente 3: analizando...")
             progress_bar.progress(90)
 
             result = st.session_state.analyzer.analyze_statements(
@@ -1808,22 +1784,22 @@ def process_uploaded_files(statement_inputs: list, generate_insights: bool):
                 generate_ai_insights=generate_insights
             )
 
-            agent3_status.success("📊 Agent 3: ✅ Complete")
+            agent3_status.success("📊 Agente 3: ✅ completado")
             progress_bar.progress(100)
-            status_text.text("✅ Analysis complete!")
+            status_text.text("✅ ¡Análisis completado!")
 
         if result['success']:
             st.session_state.analysis_result = result
             st.session_state.generate_ai_insights = generate_insights
             _clear_meta_analysis_state()
-            st.success("🎉 Consolidated analysis completed successfully!")
+            st.success("🎉 ¡Análisis consolidado completado correctamente!")
         else:
-            st.error(f"❌ Analysis failed: {result['error']}")
-            st.info("Tip: Try cleaner PDF exports (text-based, not scanned image).")
+            st.error(f"❌ Falló el análisis: {result['error']}")
+            st.info("Consejo: prueba exportaciones PDF más limpias (basadas en texto, no en imagen escaneada).")
             show_debug_diagnostics(result)
 
     except Exception as e:
-        st.error(f"❌ Error processing files: {str(e)}")
+        st.error(f"❌ Error al procesar archivos: {str(e)}")
 
     finally:
         for temp_path in temp_paths:
@@ -1839,7 +1815,7 @@ def display_results(result: dict):
     categories = analysis['category_breakdown']
     metrics = result['system_metrics']
     
-    st.header("📊 Financial Analysis Results")
+    st.header("📊 Resultados del análisis financiero")
 
     all_transactions = result.get('transactions', [])
     available_persons = sorted({t.get('person', '') for t in all_transactions if t.get('person')})
@@ -1859,24 +1835,14 @@ def display_results(result: dict):
     with filter_col2:
         document_filter = st.selectbox("Documento", ["Todos"] + available_docs, key="results_filter_document")
     with filter_col3:
-        period_mode = st.selectbox(
-            "Periodo",
-            ["Todos", "Mes", "Rango de fechas"],
-            key="results_filter_period_mode",
-        )
+        period_mode = st.selectbox("Periodo", ["Todos", "Mes", "Rango de fechas"], key="results_filter_period_mode")
 
     month_filter = "Todos"
     date_range = None
     if period_mode == "Mes":
         month_filter = st.selectbox("Mes", ["Todos"] + available_months, key="results_filter_month")
     elif period_mode == "Rango de fechas":
-        selected_range = st.date_input(
-            "Rango de fechas",
-            value=(default_start_date, default_end_date),
-            min_value=default_start_date,
-            max_value=default_end_date,
-            key="results_filter_date_range",
-        )
+        selected_range = st.date_input("Rango de fechas", value=(default_start_date, default_end_date), min_value=default_start_date, max_value=default_end_date, key="results_filter_date_range")
         if isinstance(selected_range, tuple) and len(selected_range) == 2:
             start_date, end_date = selected_range
             if start_date > end_date:
@@ -1884,83 +1850,44 @@ def display_results(result: dict):
             else:
                 date_range = (start_date, end_date)
 
-    filtered_transactions = _filter_transactions(
-        all_transactions,
-        person_filter,
-        month_filter,
-        document_filter,
-        date_filter_mode=period_mode,
-        date_range=date_range,
-    )
+    filtered_transactions = _filter_transactions(all_transactions, person_filter, month_filter, document_filter, date_filter_mode=period_mode, date_range=date_range)
     if not filtered_transactions and all_transactions:
         st.warning("No hay transacciones para la combinación de filtros seleccionada.")
 
     visible_summary = _summarize_transactions(filtered_transactions)
-    
-    # Key metrics in cards
+
     col1, col2, col3, col4 = st.columns(4)
-    
     with col1:
-        st.metric(
-            "💰 Total Spent",
-            f"${visible_summary['total_spent']:.2f}",
-            delta=f"{visible_summary['debit_count']} transactions"
-        )
-    
+        st.metric("💰 Gasto total", f"${visible_summary['total_spent']:.2f}", delta=f"{visible_summary['debit_count']} transacciones")
     with col2:
-        st.metric(
-            "💵 Total Income", 
-            f"${visible_summary['total_income']:.2f}",
-            delta=f"{visible_summary['credit_count']} deposits"
-        )
-    
+        st.metric("💵 Ingresos totales", f"${visible_summary['total_income']:.2f}", delta=f"{visible_summary['credit_count']} depósitos")
     with col3:
         net_change = visible_summary['net_change']
-        st.metric(
-            "📊 Net Change",
-            f"${net_change:.2f}",
-            delta="Positive" if net_change > 0 else "Negative",
-            delta_color="normal" if net_change > 0 else "inverse"
-        )
-    
+        st.metric("📊 Cambio neto", f"${net_change:.2f}", delta="Positivo" if net_change > 0 else "Negativo", delta_color="normal" if net_change > 0 else "inverse")
     with col4:
-        st.metric(
-            "🤖 System Efficiency",
-            f"{metrics['total_llm_calls']} LLM calls",
-            delta=f"${metrics['estimated_cost']:.4f} cost"
-        )
+        st.metric("🤖 Eficiencia del sistema", f"{metrics['total_llm_calls']} llamadas LLM", delta=f"costo ${metrics['estimated_cost']:.4f}")
 
-    st.caption(
-        f"Transacciones visibles: {len(filtered_transactions)} / {len(all_transactions)} "
-        f"(filtros aplicados por persona/documento/periodo)"
-    )
+    st.caption(f"Transacciones visibles: {len(filtered_transactions)} / {len(all_transactions)} (filtros aplicados por persona/documento/periodo)")
 
     analyzer = st.session_state.get('analyzer')
     monthly_summary = analyzer.aggregate_by_month(filtered_transactions) if analyzer and filtered_transactions else []
     monthly_trends = analyzer.compute_monthly_trends(monthly_summary) if analyzer and monthly_summary else {}
     if monthly_summary:
-        st.subheader("🗓️ Monthly Consolidation (visible period)")
+        st.subheader("🗓️ Consolidación mensual (periodo visible)")
         month_df = pd.DataFrame(monthly_summary)
         if not month_df.empty:
-            st.dataframe(
-                month_df[['month', 'total_income', 'total_spent', 'net_change', 'transaction_count']],
-                use_container_width=True,
-                hide_index=True,
-            )
+            st.dataframe(month_df[['month', 'total_income', 'total_spent', 'net_change', 'transaction_count']], use_container_width=True, hide_index=True)
 
         if monthly_trends:
             trend_label = monthly_trends.get('classification', 'unknown')
             trend_details = monthly_trends.get('details', '')
             st.info(f"Tendencia: **{trend_label}**. {trend_details}")
-    
-    # Charts section
+
     if categories:
         chart_col1, chart_col2 = st.columns(2)
-        
+
         with chart_col1:
-            st.subheader("🏷️ Spending by Category")
-            
-            # Build the pie from raw debit transactions so each slice reflects total spend.
+            st.subheader("🏷️ Gasto por categoría")
             spending_totals = {}
             for txn in filtered_transactions:
                 if txn.get('is_debit') and txn.get('effective_is_spending', True):
@@ -1970,67 +1897,25 @@ def display_results(result: dict):
             if not spending_totals:
                 st.info("No hay gastos efectivos para graficar bajo los filtros actuales.")
             else:
-                spending_rows = (
-                    pd.DataFrame(
-                        [{
-                            'Category': category,
-                            'Amount': float(amount)
-                        } for category, amount in spending_totals.items()]
-                    )
-                    .sort_values('Amount', ascending=False)
-                    .reset_index(drop=True)
-                )
-
+                spending_rows = pd.DataFrame([{'Category': category, 'Amount': float(amount)} for category, amount in spending_totals.items()]).sort_values('Amount', ascending=False).reset_index(drop=True)
                 category_names = spending_rows['Category'].tolist()
                 category_amounts = spending_rows['Amount'].tolist()
                 pie_colors = px.colors.qualitative.Set3 + px.colors.qualitative.Pastel + px.colors.qualitative.Bold
-                
-                fig_pie = go.Figure(
-                    data=[
-                        go.Pie(
-                            labels=category_names,
-                            values=category_amounts,
-                            sort=False,
-                            direction='clockwise',
-                            textposition='inside',
-                            textinfo='percent+label',
-                            marker=dict(
-                                colors=pie_colors[:len(category_names)],
-                                line=dict(color='white', width=2)
-                            )
-                        )
-                    ]
-                )
-                fig_pie.update_layout(
-                    title="Spending Distribution",
-                    showlegend=True,
-                    margin=dict(t=40, l=10, r=10, b=10)
-                )
+                fig_pie = go.Figure(data=[go.Pie(labels=category_names, values=category_amounts, sort=False, direction='clockwise', textposition='inside', textinfo='percent+label', marker=dict(colors=pie_colors[:len(category_names)], line=dict(color='white', width=2)))])
+                fig_pie.update_layout(title="Distribución del gasto", showlegend=True, margin=dict(t=40, l=10, r=10, b=10))
                 if PLOTLY_EVENTS_AVAILABLE:
-                    selected_points = plotly_events(
-                        fig_pie,
-                        click_event=True,
-                        hover_event=False,
-                        select_event=False,
-                        key='spending_category_pie_events'
-                    )
-
+                    selected_points = plotly_events(fig_pie, click_event=True, hover_event=False, select_event=False, key='spending_category_pie_events')
                     if selected_points:
                         point_index = selected_points[0].get('pointNumber')
                         if point_index is not None and 0 <= point_index < len(category_names):
                             _show_category_items_modal(category_names[point_index], filtered_transactions)
                 else:
                     st.plotly_chart(fig_pie, use_container_width=True)
-                    st.caption("Install 'streamlit-plotly-events' to enable click-to-open category modal.")
-        
-        with chart_col2:
-            st.subheader("📈 Category Breakdown")
-            
-            filtered_debits = [
-                t for t in filtered_transactions
-                if t.get('is_debit') and t.get('effective_is_spending', True)
-            ]
+                    st.caption("Instala 'streamlit-plotly-events' para habilitar el modal de categoría al hacer clic.")
 
+        with chart_col2:
+            st.subheader("📈 Desglose por categoría")
+            filtered_debits = [t for t in filtered_transactions if t.get('is_debit') and t.get('effective_is_spending', True)]
             if not filtered_debits:
                 st.info("No hay gastos efectivos para mostrar desglose con los filtros actuales.")
             else:
@@ -2045,50 +1930,33 @@ def display_results(result: dict):
                 rows = []
                 for cat, amount in totals.items():
                     pct = (amount / total_spent_filtered * 100) if total_spent_filtered > 0 else 0.0
-                    rows.append({
-                        'Category': cat.replace('_', ' ').title(),
-                        'Amount': amount,
-                        'Percentage': pct,
-                        'Count': counts.get(cat, 0),
-                    })
+                    rows.append({'Category': cat.replace('_', ' ').title(), 'Amount': amount, 'Percentage': pct, 'Count': counts.get(cat, 0)})
 
                 df_categories = pd.DataFrame(rows).sort_values('Amount', ascending=False).head(6)
-                fig_bar = px.bar(
-                    df_categories,
-                    x='Category',
-                    y='Amount',
-                    title="Top Categories by Amount",
-                    text='Amount',
-                    color='Percentage',
-                    color_continuous_scale='Viridis'
-                )
+                fig_bar = px.bar(df_categories, x='Category', y='Amount', title="Principales categorías por monto", text='Amount', color='Percentage', color_continuous_scale='Viridis')
                 fig_bar.update_traces(texttemplate='$%{text:.0f}', textposition='outside')
                 fig_bar.update_layout(showlegend=False)
                 st.plotly_chart(fig_bar, use_container_width=True)
 
-    # Insights sections
     insight_col1, insight_col2 = st.columns(2)
-    
+
     with insight_col1:
-        st.subheader("💡 Financial Insights")
+        st.subheader("💡 Hallazgos financieros")
         for insight in analysis['basic_insights']:
             st.write(f"• {insight}")
-    
+
     with insight_col2:
         if analysis.get('ai_insights') and analysis['ai_insights']:
-            st.subheader("🤖 AI Recommendations")
-            for insight in analysis['ai_insights'][:5]:  # Limit to 5
-                if insight.strip():  # Only show non-empty insights
+            st.subheader("🤖 Recomendaciones de IA")
+            for insight in analysis['ai_insights'][:5]:
+                if insight.strip():
                     st.write(f"• {insight}")
         else:
-            st.info("🤖 Enable 'Generate AI Insights' for personalized recommendations")
-    
-    # Transaction details (expandable)
-    with st.expander("📋 View All Transactions", expanded=False):
-        if all_transactions:
-            st.caption("You can edit categories for any row. Then click 'Update report' to recalculate metrics, charts, and LLM insights.")
+            st.info("🤖 Activa 'Generar hallazgos con IA' para recomendaciones personalizadas")
 
-            st.caption("Puedes editar categorías por cartola: usa el filtro Documento para revisar cada archivo por separado. Los filtros de periodo solo cambian lo que ves.")
+    with st.expander("📋 Ver todas las transacciones", expanded=False):
+        if all_transactions:
+            st.caption("Puedes editar las categorías de cualquier fila. Luego haz clic en 'Actualizar informe' para recalcular métricas, gráficos y hallazgos de IA.")
 
             if filtered_transactions:
                 df_transactions = _transactions_to_editor_df(filtered_transactions)
@@ -2113,32 +1981,32 @@ def display_results(result: dict):
                         'Internal transfer?': st.column_config.CheckboxColumn('Internal transfer?', disabled=True),
                         'Confidence': st.column_config.TextColumn('Confidence', disabled=True),
                         'Source': st.column_config.TextColumn('Source', disabled=True),
-                        'Category': st.column_config.SelectboxColumn('Category', options=category_labels, required=True)
-                    }
+                        'Category': st.column_config.SelectboxColumn('Category', options=category_labels, required=True),
+                    },
                 )
 
-                if st.button("🔄 Update report with manual categories", type="secondary", use_container_width=True):
+                if st.button("🔄 Actualizar informe con categorías manuales", type="secondary", use_container_width=True):
                     _apply_manual_category_updates(result, edited_df)
             else:
                 st.info("No hay transacciones que coincidan con los filtros actuales.")
 
     st.divider()
-    st.subheader("🧠 Meta Analysis")
-    st.caption("Run this only after reviewing and correcting transaction categories. This will make one additional LLM call using the knowledge base stored in data/advisory_knowledge_base_v1.json.")
+    st.subheader("🧠 Meta análisis")
+    st.caption("Ejecuta esto solo después de revisar y corregir las categorías de transacción. Hará una llamada LLM adicional usando la base de conocimiento guardada en data/advisory_knowledge_base_v1.json.")
 
     meta_button_disabled = st.session_state.get('analysis_result') is None
-    if st.button("🚀 Run Meta Analysis", type="primary", use_container_width=True, disabled=meta_button_disabled):
+    if st.button("🚀 Ejecutar meta análisis", type="primary", use_container_width=True, disabled=meta_button_disabled):
         try:
-            with st.spinner("Running meta analysis with knowledge base..."):
+            with st.spinner("Ejecutando meta análisis con la base de conocimiento..."):
                 meta_state = _run_meta_analysis(result)
                 st.session_state.meta_analysis_result = meta_state['result']
                 st.session_state.meta_analysis_metrics = meta_state['metrics']
                 st.session_state.meta_analysis_source = meta_state['source_signature']
                 st.session_state.meta_analysis_error = None
-            st.success("Meta analysis completed successfully.")
+            st.success("Meta análisis completado correctamente.")
         except Exception as e:
             st.session_state.meta_analysis_error = str(e)
-            st.error(f"Meta analysis failed: {e}")
+            st.error(f"Falló el meta análisis: {e}")
 
     meta_result = st.session_state.get('meta_analysis_result')
     meta_source = st.session_state.get('meta_analysis_source')
@@ -2150,7 +2018,7 @@ def display_results(result: dict):
             'metrics': st.session_state.get('meta_analysis_metrics', {}),
         })
     elif st.session_state.get('meta_analysis_error'):
-        st.warning(f"Last meta analysis attempt failed: {st.session_state.meta_analysis_error}")
+        st.warning(f"El último intento de meta análisis falló: {st.session_state.meta_analysis_error}")
 
 
 def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
