@@ -145,10 +145,10 @@ def _summarize_transactions(transactions: list) -> dict:
 
     for txn in transactions:
         amount = float(txn.get('amount') or 0.0)
-        if txn.get('is_debit'):
+        if txn.get('effective_is_spending', txn.get('is_debit', False)):
             total_spent += amount
             debit_count += 1
-        else:
+        elif txn.get('effective_is_income', not txn.get('is_debit', False)):
             total_income += amount
             credit_count += 1
 
