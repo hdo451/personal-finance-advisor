@@ -7,6 +7,7 @@ Beautiful web interface for your hybrid multi-agent system
 
 import json
 import re
+import math
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
@@ -334,6 +335,22 @@ def _is_number_like(v):
         return True
     except Exception:
         return False
+
+
+def _normalize_ratio_value(value, *, max_abs: float = 100.0):
+    """Return a finite ratio value or None when the input is missing or implausible."""
+    try:
+        numeric_value = float(value)
+    except Exception:
+        return None
+
+    if not math.isfinite(numeric_value):
+        return None
+
+    if abs(numeric_value) > max_abs:
+        return None
+
+    return numeric_value
 
 
 def _validate_solved_result(solved: dict):
@@ -1330,7 +1347,7 @@ def _render_meta_analysis_result(meta_state: dict):
     income = summary.get('income', 0)
     expenses = summary.get('expenses', 0)
     savings = income - expenses
-    savings_rate = summary.get('savings_rate', 0)
+    savings_rate = _normalize_ratio_value(summary.get('savings_rate', 0))
     health_status = summary.get('financial_health', 'neutral')
     
     # 1. Resumen General
@@ -1347,13 +1364,17 @@ def _render_meta_analysis_result(meta_state: dict):
         health_emoji = {"good": "✔️", "risk": "⚠️", "critical": "🚨", "neutral": "➖"}.get(health_status, "➖")
         st.metric(f"{health_emoji} Estado", health_status.upper())
     
-    st.write(f"**Tasa de ahorro: {savings_rate*100:.1f}%**")
-    if savings_rate > 0.20:
-        st.success("✔️ Excelente: ahorras más de lo que gastas.")
-    elif savings_rate > 0.10:
-        st.info("✔️ Bueno: estás ahorrando regularmente.")
+    if savings_rate is None:
+        st.write("**Tasa de ahorro: N/D**")
+        st.warning("⚠️ No se pudo determinar una tasa de ahorro fiable para este reporte.")
     else:
-        st.warning("⚠️ Atención: necesitas aumentar tu tasa de ahorro.")
+        st.write(f"**Tasa de ahorro: {savings_rate*100:.1f}%**")
+        if savings_rate > 0.20:
+            st.success("✔️ Excelente: ahorras más de lo que gastas.")
+        elif savings_rate > 0.10:
+            st.info("✔️ Bueno: estás ahorrando regularmente.")
+        else:
+            st.warning("⚠️ Atención: necesitas aumentar tu tasa de ahorro.")
     
     st.divider()
     
@@ -1415,39 +1436,51 @@ def _render_meta_analysis_result(meta_state: dict):
         
         with col1:
             if 'savings_rate' in ratios:
-                sr = ratios['savings_rate'].get('value', 0)
-                st.write(f"**Tasa de Ahorro:** {sr*100:.1f}%")
-                if sr > 0.20:
-                    st.success("✔️ Muy buena (ideal >20%)")
-                elif sr > 0.10:
-                    st.info("✔️ Aceptable")
+                sr = _normalize_ratio_value(ratios['savings_rate'].get('value', 0))
+                if sr is None:
+                    st.write("**Tasa de Ahorro:** N/D")
                 else:
-                    st.warning("⚠️ Por debajo del ideal")
+                    st.write(f"**Tasa de Ahorro:** {sr*100:.1f}%")
+                    if sr > 0.20:
+                        st.success("✔️ Muy buena (ideal >20%)")
+                    elif sr > 0.10:
+                        st.info("✔️ Aceptable")
+                    else:
+                        st.warning("⚠️ Por debajo del ideal")
             
             if 'housing_ratio' in ratios:
-                hr = ratios['housing_ratio'].get('value', 0)
-                st.write(f"**Carga de Vivienda:** {hr*100:.1f}%")
-                if hr < 0.30:
-                    st.success("✔️ Saludable (<30%)")
+                hr = _normalize_ratio_value(ratios['housing_ratio'].get('value', 0))
+                if hr is None:
+                    st.write("**Carga de Vivienda:** N/D")
                 else:
-                    st.warning("⚠️ Elevado (>30%)")
+                    st.write(f"**Carga de Vivienda:** {hr*100:.1f}%")
+                    if hr < 0.30:
+                        st.success("✔️ Saludable (<30%)")
+                    else:
+                        st.warning("⚠️ Elevado (>30%)")
         
         with col2:
             if 'debt_ratio' in ratios:
-                dr = ratios['debt_ratio'].get('value', 0)
-                st.write(f"**Ratio Deuda/Ingreso:** {dr*100:.1f}%")
-                if dr < 0.15:
-                    st.success("✔️ Bajo → buena capacidad financiera")
+                dr = _normalize_ratio_value(ratios['debt_ratio'].get('value', 0))
+                if dr is None:
+                    st.write("**Ratio Deuda/Ingreso:** N/D")
                 else:
-                    st.warning("⚠️ Moderado a alto")
+                    st.write(f"**Ratio Deuda/Ingreso:** {dr*100:.1f}%")
+                    if dr < 0.15:
+                        st.success("✔️ Bajo → buena capacidad financiera")
+                    else:
+                        st.warning("⚠️ Moderado a alto")
             
             if 'discretionary_ratio' in ratios:
-                disr = ratios['discretionary_ratio'].get('value', 0)
-                st.write(f"**Gasto Discrecional:** {disr*100:.1f}%")
-                if disr < 0.20:
-                    st.success("✔️ Controlado")
+                disr = _normalize_ratio_value(ratios['discretionary_ratio'].get('value', 0))
+                if disr is None:
+                    st.write("**Gasto Discrecional:** N/D")
                 else:
-                    st.warning("⚠️ Elevado - oportunidad de optimización")
+                    st.write(f"**Gasto Discrecional:** {disr*100:.1f}%")
+                    if disr < 0.20:
+                        st.success("✔️ Controlado")
+                    else:
+                        st.warning("⚠️ Elevado - oportunidad de optimización")
     
     st.divider()
     
