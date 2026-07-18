@@ -7,6 +7,7 @@ Beautiful web interface for your hybrid multi-agent system
 
 import json
 import re
+import math
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
@@ -15,6 +16,7 @@ from datetime import datetime, date
 import os
 import copy
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
@@ -30,6 +32,14 @@ except ImportError:
 from main_coordinator import BankStatementAnalyzer
 from utils.financial_solver import solve_problem
 from utils.llm_interface import resolve_openai_api_key
+from utils.custom_categories import (
+    CUSTOM_CATEGORY_IDS,
+    assign_effective_category,
+    default_custom_category_labels,
+    is_custom_category,
+    resolve_category_label,
+    validate_custom_category_labels,
+)
 
 KNOWLEDGE_BASE_PATH = Path(__file__).resolve().parent / "data" / "advisory_knowledge_base_v1.json"
 
@@ -42,19 +52,61 @@ CATEGORY_CODES = [
     'entertainment',
     'healthcare',
     'income',
+    'other_income',
+    'international_transfer_in',
+    'international_transfer_out',
     'fees',
     'other',
     'uncategorized',
 ]
 
+CATEGORY_LABELS = {
+    'other_income': 'Other Income',
+    'international_transfer_in': 'International Transfer Received',
+    'international_transfer_out': 'International Transfer Sent',
+}
+
 def _category_code_to_label(code: str) -> str:
-    return code.replace('_', ' ').title()
+    custom_labels = st.session_state.get(
+        'custom_category_labels', default_custom_category_labels()
+    )
+    return resolve_category_label(code, custom_labels, CATEGORY_LABELS)
 
 def _category_label_to_code(label: str) -> str:
+    custom_labels = st.session_state.get(
+        'custom_category_labels', default_custom_category_labels()
+    )
+    normalized_label = str(label).strip().casefold()
+    for code, display_label in custom_labels.items():
+        if normalized_label == str(display_label).strip().casefold():
+            return code
+    for code, display_label in CATEGORY_LABELS.items():
+        if normalized_label == display_label.casefold():
+            return code
     normalized = str(label).strip().lower().replace(' ', '_')
     if normalized in CATEGORY_CODES:
         return normalized
     return 'other'
+
+
+def _selectable_category_labels() -> list[str]:
+    """Return standard and session-only custom labels for transaction editing."""
+    standard = [
+        _category_code_to_label(code)
+        for code in CATEGORY_CODES
+        if code != 'uncategorized'
+    ]
+    custom = [_category_code_to_label(code) for code in CUSTOM_CATEGORY_IDS]
+    return standard + custom
+
+
+def _analysis_category_labels() -> dict[str, str]:
+    """Return labels needed by deterministic analysis for custom category IDs."""
+    return dict(
+        st.session_state.get(
+            'custom_category_labels', default_custom_category_labels()
+        )
+    )
 
 def _transactions_to_editor_df(transactions: list) -> pd.DataFrame:
     """Create editable DataFrame for manual category review."""
@@ -62,6 +114,7 @@ def _transactions_to_editor_df(transactions: list) -> pd.DataFrame:
     for idx, txn in enumerate(transactions):
         rows.append({
             '_txn_index': int(txn.get('_global_index', idx)),
+            'Select': False,
             'Date': txn['date'],
             'Month': txn.get('month', ''),
             'Person': txn.get('person', ''),
@@ -77,6 +130,113 @@ def _transactions_to_editor_df(transactions: list) -> pd.DataFrame:
             'Source': txn['source'].title()
         })
     return pd.DataFrame(rows)
+
+
+def _refresh_analysis_result(
+    result: dict,
+    updated_transactions: list,
+    generate_ai_insights: bool,
+) -> tuple[dict, int, float]:
+    """Recompute the report after category changes and return incremental LLM use."""
+    llm_before_calls = st.session_state.analyzer.llm.call_count
+    llm_before_cost = st.session_state.analyzer.llm.total_cost
+
+    st.session_state.analyzer.agent3.llm_calls_made = 0
+    updated_analysis = st.session_state.analyzer.agent3.process(
+        updated_transactions,
+        generate_ai_insights=generate_ai_insights,
+        category_labels=_analysis_category_labels(),
+    )
+
+    llm_added_calls = st.session_state.analyzer.llm.call_count - llm_before_calls
+    llm_added_cost = st.session_state.analyzer.llm.total_cost - llm_before_cost
+
+    updated_result = copy.deepcopy(result)
+    updated_result['transactions'] = updated_transactions
+    updated_result['analysis'] = updated_analysis
+    if hasattr(st.session_state.analyzer, 'aggregate_by_month'):
+        updated_result['monthly_summary'] = st.session_state.analyzer.aggregate_by_month(
+            updated_transactions
+        )
+    if hasattr(st.session_state.analyzer, 'compute_monthly_trends'):
+        updated_result['monthly_trends'] = st.session_state.analyzer.compute_monthly_trends(
+            updated_result.get('monthly_summary', [])
+        )
+    updated_result['system_metrics']['total_llm_calls'] += max(llm_added_calls, 0)
+    updated_result['system_metrics']['estimated_cost'] += max(llm_added_cost, 0.0)
+    updated_result['system_metrics']['processing_time'] = datetime.now().isoformat()
+    updated_result['system_metrics']['agent_breakdown']['agent3_llm_calls'] += max(
+        llm_added_calls, 0
+    )
+    return updated_result, llm_added_calls, llm_added_cost
+
+
+def _save_custom_category_labels(result: dict, proposed_labels: dict):
+    """Validate and apply custom labels for the current Streamlit session only."""
+    reserved_labels = [
+        resolve_category_label(code, system_labels=CATEGORY_LABELS)
+        for code in CATEGORY_CODES
+        if code != 'uncategorized'
+    ]
+    normalized = validate_custom_category_labels(proposed_labels, reserved_labels)
+    previous = _analysis_category_labels()
+    if normalized == previous:
+        st.info("Los nombres no cambiaron.")
+        return
+
+    st.session_state.custom_category_labels = normalized
+    assigned_custom = any(
+        is_custom_category(txn.get('category'))
+        for txn in result.get('transactions', [])
+    )
+    if assigned_custom:
+        updated_result, _, _ = _refresh_analysis_result(
+            result,
+            copy.deepcopy(result['transactions']),
+            generate_ai_insights=False,
+        )
+        st.session_state.analysis_result = updated_result
+        st.session_state.generate_ai_insights = False
+        _clear_meta_analysis_state()
+
+    st.session_state.category_flash_message = (
+        "Nombres personalizados actualizados para esta sesión."
+    )
+    st.rerun()
+
+
+def _render_custom_category_manager(result: dict):
+    """Render session-only custom category naming controls."""
+    labels = _analysis_category_labels()
+    with st.expander(
+        "✏️ Renombrar Auxiliar 1, Auxiliar 2 y Auxiliar 3",
+        expanded=True,
+    ):
+        st.caption(
+            "Escribe el nombre que quieras usar para cada categoría, por ejemplo "
+            "'Hermana enferma'. Los nombres y asignaciones se borran al finalizar "
+            "la sesión y nunca generan reglas de aprendizaje."
+        )
+        with st.form("custom_category_names_form"):
+            cols = st.columns(3)
+            proposed = {}
+            for index, category_id in enumerate(CUSTOM_CATEGORY_IDS):
+                with cols[index]:
+                    proposed[category_id] = st.text_input(
+                        f"Nombre de Auxiliar {index + 1}",
+                        value=labels[category_id],
+                        max_chars=50,
+                        key=f"custom_category_name_{category_id}",
+                    )
+            submitted = st.form_submit_button(
+                "💾 Guardar nuevos nombres", use_container_width=True
+            )
+
+        if submitted:
+            try:
+                _save_custom_category_labels(result, proposed)
+            except ValueError as exc:
+                st.error(str(exc))
 
 
 def _parse_transaction_date(date_text: str) -> Optional[date]:
@@ -110,6 +270,7 @@ def _filter_transactions(
     person_filter: str,
     month_filter: str,
     document_filter: str,
+    category_filter: str = "__all__",
     date_filter_mode: str = "Todos",
     date_range: Optional[tuple[Optional[date], Optional[date]]] = None,
 ) -> list:
@@ -120,6 +281,8 @@ def _filter_transactions(
         if month_filter != "Todos" and txn.get('month') != month_filter:
             continue
         if document_filter != "Todos" and txn.get('source_file_name') != document_filter:
+            continue
+        if category_filter != "__all__" and txn.get('category') != category_filter:
             continue
 
         txn_date = _parse_transaction_date(txn.get('date'))
@@ -144,10 +307,10 @@ def _summarize_transactions(transactions: list) -> dict:
 
     for txn in transactions:
         amount = float(txn.get('amount') or 0.0)
-        if txn.get('is_debit'):
+        if txn.get('effective_is_spending', txn.get('is_debit', False)):
             total_spent += amount
             debit_count += 1
-        else:
+        elif txn.get('effective_is_income', not txn.get('is_debit', False)):
             total_income += amount
             credit_count += 1
 
@@ -228,7 +391,20 @@ def _extract_json_response(response_text: str) -> dict:
 
 def _build_meta_analysis_payload(result: dict) -> dict:
     analysis = result['analysis']
+    visible_summary = _summarize_transactions(result['transactions'])
+    income = float(visible_summary.get('total_income') or 0.0)
+    expenses = float(visible_summary.get('total_spent') or 0.0)
+    savings = income - expenses
+    savings_rate = (savings / income) if income > 0 else 0.0
+
     return {
+        'base_summary': {
+            'income': income,
+            'expenses': expenses,
+            'savings': savings,
+            'savings_rate': savings_rate,
+            'financial_health': 'good' if savings_rate > 0.20 else 'acceptable' if savings_rate > 0.10 else 'risk',
+        },
         'financial_summary': analysis['financial_summary'],
         'category_breakdown': analysis['category_breakdown'],
         'spending_patterns': analysis['spending_patterns'],
@@ -238,6 +414,13 @@ def _build_meta_analysis_payload(result: dict) -> dict:
                 'date': txn['date'],
                 'description': txn['description'],
                 'category': txn['category'],
+                'category_label': _category_code_to_label(txn['category']),
+                'category_type': (
+                    'user_custom'
+                    if is_custom_category(txn['category'])
+                    else 'system'
+                ),
+                'detected_category': txn.get('detected_category', txn['category']),
                 'amount': txn['amount'],
                 'is_debit': txn['is_debit'],
                 'confidence': txn['confidence'],
@@ -246,6 +429,75 @@ def _build_meta_analysis_payload(result: dict) -> dict:
             for txn in result['transactions']
         ]
     }
+
+
+def _annotate_meta_category_types(meta_result: dict, payload: dict) -> dict:
+    """Restore authoritative category IDs/types if the advisory response omits them."""
+    annotated = copy.deepcopy(meta_result)
+    source_categories = payload.get('category_breakdown', []) or []
+    by_code = {
+        str(item.get('category')): item
+        for item in source_categories
+        if item.get('category')
+    }
+    by_label = {
+        str(item.get('category_label', '')).strip().casefold(): item
+        for item in source_categories
+        if str(item.get('category_label', '')).strip()
+    }
+
+    for item in annotated.get('category_analysis', []) or []:
+        if not isinstance(item, dict):
+            continue
+        response_category = str(item.get('category', ''))
+        source = by_code.get(response_category) or by_label.get(
+            response_category.strip().casefold()
+        )
+        if not source:
+            continue
+        item['category'] = source.get('category', response_category)
+        item['category_label'] = source.get(
+            'category_label', _category_code_to_label(item['category'])
+        )
+        item['category_type'] = source.get('category_type', 'system')
+
+    return annotated
+
+
+def _merge_meta_summary_with_base(meta_result: dict, payload: dict) -> dict:
+    """Fill missing or non-finite summary values from the verified base analysis."""
+    merged = copy.deepcopy(meta_result)
+    base_summary = payload.get('base_summary', {}) or {}
+    summary = merged.get('summary') if isinstance(merged.get('summary'), dict) else {}
+
+    base_income = float(base_summary.get('income') or 0.0)
+    base_expenses = float(base_summary.get('expenses') or 0.0)
+    base_savings_rate = float(base_summary.get('savings_rate') or 0.0)
+    base_health = base_summary.get('financial_health', 'neutral')
+
+    income = summary.get('income') if _is_number_like(summary.get('income')) else None
+    expenses = summary.get('expenses') if _is_number_like(summary.get('expenses')) else None
+    savings_rate = summary.get('savings_rate') if _is_number_like(summary.get('savings_rate')) else None
+    financial_health = summary.get('financial_health') if summary.get('financial_health') in {'good', 'acceptable', 'risk'} else None
+
+    if income is None or float(income) == 0.0:
+        income = base_income
+    if expenses is None or float(expenses) == 0.0:
+        expenses = base_expenses
+    if savings_rate is None:
+        savings_rate = base_savings_rate
+    if financial_health is None:
+        financial_health = base_health
+
+    merged['summary'] = {
+        **summary,
+        'income': float(income),
+        'expenses': float(expenses),
+        'savings_rate': float(savings_rate),
+        'financial_health': financial_health,
+    }
+
+    return merged
 
 
 def _redact_diagnostic_line(line: str) -> str:
@@ -269,6 +521,10 @@ Use the knowledge base below as the primary policy and evaluation source.
 Rules:
 - Do not invent data.
 - Do not infer income, debt capacity, or intent without explicit evidence.
+- Treat payload.base_summary as the authoritative source for income, expenses, savings, and savings_rate.
+- Preserve transaction category codes exactly in category_analysis.
+- A category marked category_type=user_custom is a temporary user reporting bucket. Include it in total expenses, but do not classify it as fixed, variable, discretionary, unnecessary, or reducible without independent evidence.
+- Do not use user_custom categories as learned merchant classifications.
 - Prioritize prudence and risk reduction when uncertainty exists.
 - Return ONLY valid JSON matching the output contract in the knowledge base.
 - Every recommendation must include evidence.
@@ -302,6 +558,8 @@ Base analysis context:
         raise ValueError("Meta analysis LLM call failed. Could not obtain response from OpenAI.")
 
     meta_result = _extract_json_response(response)
+    meta_result = _merge_meta_summary_with_base(meta_result, payload)
+    meta_result = _annotate_meta_category_types(meta_result, payload)
 
     # Validate meta_result against knowledge base output contract (basic checks)
     kb_contract = knowledge_base.get('output_contract', {})
@@ -334,6 +592,22 @@ def _is_number_like(v):
         return True
     except Exception:
         return False
+
+
+def _normalize_ratio_value(value, *, max_abs: float = 100.0):
+    """Return a finite ratio value or None when the input is missing or implausible."""
+    try:
+        numeric_value = float(value)
+    except Exception:
+        return None
+
+    if not math.isfinite(numeric_value):
+        return None
+
+    if abs(numeric_value) > max_abs:
+        return None
+
+    return numeric_value
 
 
 def _validate_solved_result(solved: dict):
@@ -1208,6 +1482,31 @@ def render_problem_solver_page():
     render_problem_solver_page_v2()
 
 
+def _meta_category_is_custom(category_item: dict) -> bool:
+    """Identify a custom category in a meta-analysis response."""
+    if category_item.get('category_type') == 'user_custom':
+        return True
+    code = category_item.get('category', '')
+    if is_custom_category(code):
+        return True
+    response_label = str(
+        category_item.get('category_label') or code or ''
+    ).strip().casefold()
+    custom_labels = {
+        str(label).strip().casefold()
+        for label in _analysis_category_labels().values()
+    }
+    return response_label in custom_labels
+
+
+def _meta_category_label(category_item: dict) -> str:
+    """Return the best available display name for a meta-analysis category."""
+    explicit = str(category_item.get('category_label') or '').strip()
+    if explicit:
+        return explicit
+    return _category_code_to_label(category_item.get('category', 'other'))
+
+
 def _generate_executive_summary(result: dict, income: float, expenses: float, savings: float, savings_rate: float, health_status: str) -> str:
     """Generate a professional narrative executive summary.
 
@@ -1231,11 +1530,14 @@ def _generate_executive_summary(result: dict, income: float, expenses: float, sa
     total_fixed = 0.0
     total_variable = 0.0
     total_discretionary = 0.0
+    total_custom = 0.0
 
     for cat in categories:
         cat_name = cat.get('category', '')
         spent = float(cat.get('spent') or 0)
-        if cat_name in fixed_categories:
+        if _meta_category_is_custom(cat):
+            total_custom += spent
+        elif cat_name in fixed_categories:
             total_fixed += spent
         elif cat_name in variable_categories:
             total_variable += spent
@@ -1265,6 +1567,7 @@ def _generate_executive_summary(result: dict, income: float, expenses: float, sa
     fixed_s = fmt_money(total_fixed)
     variable_s = fmt_money(total_variable)
     discretionary_s = fmt_money(total_discretionary)
+    custom_s = fmt_money(total_custom)
 
     # Build narrative as controlled HTML to avoid Markdown formatting side effects
     if health_status == "good":
@@ -1280,10 +1583,11 @@ def _generate_executive_summary(result: dict, income: float, expenses: float, sa
                    f"Con ingresos de {income_s} y gastos de {expenses_s}, logras un ahorro de {savings_s} ({savings_rate*100:.1f}%). "
                    f"Hay margen para mejora en varios aspectos de tu gestión financiera.</p>")
 
-    breakdown = (f"<p><strong>Estructura de Gastos:</strong> Tu gasto total se distribuye en tres categorías clave. "
+    breakdown = (f"<p><strong>Estructura de Gastos:</strong> Los gastos con clasificación financiera se distribuyen en tres grupos. "
                  f"Los gastos fijos representan {fixed_pct:.0f}% del presupuesto ({fixed_s}). "
                  f"Los gastos variables representan {variable_pct:.0f}% ({variable_s}). "
-                 f"Los gastos discrecionales alcanzan {discretionary_pct:.0f}% ({discretionary_s}).</p>")
+                 f"Los gastos discrecionales alcanzan {discretionary_pct:.0f}% ({discretionary_s}). "
+                 f"Además, {custom_s} corresponden a categorías personalizadas y no se clasifican automáticamente en esos tres grupos.</p>")
 
     if discretionary_pct > 25:
         finding = (f"<p><strong>Hallazgo Principal:</strong> Se identifica un nivel significativo de gasto discrecional ({discretionary_pct:.0f}%). "
@@ -1330,7 +1634,7 @@ def _render_meta_analysis_result(meta_state: dict):
     income = summary.get('income', 0)
     expenses = summary.get('expenses', 0)
     savings = income - expenses
-    savings_rate = summary.get('savings_rate', 0)
+    savings_rate = _normalize_ratio_value(summary.get('savings_rate', 0))
     health_status = summary.get('financial_health', 'neutral')
     
     # 1. Resumen General
@@ -1347,13 +1651,17 @@ def _render_meta_analysis_result(meta_state: dict):
         health_emoji = {"good": "✔️", "risk": "⚠️", "critical": "🚨", "neutral": "➖"}.get(health_status, "➖")
         st.metric(f"{health_emoji} Estado", health_status.upper())
     
-    st.write(f"**Tasa de ahorro: {savings_rate*100:.1f}%**")
-    if savings_rate > 0.20:
-        st.success("✔️ Excelente: ahorras más de lo que gastas.")
-    elif savings_rate > 0.10:
-        st.info("✔️ Bueno: estás ahorrando regularmente.")
+    if savings_rate is None:
+        st.write("**Tasa de ahorro: N/D**")
+        st.warning("⚠️ No se pudo determinar una tasa de ahorro fiable para este reporte.")
     else:
-        st.warning("⚠️ Atención: necesitas aumentar tu tasa de ahorro.")
+        st.write(f"**Tasa de ahorro: {savings_rate*100:.1f}%**")
+        if savings_rate > 0.20:
+            st.success("✔️ Excelente: ahorras más de lo que gastas.")
+        elif savings_rate > 0.10:
+            st.info("✔️ Bueno: estás ahorrando regularmente.")
+        else:
+            st.warning("⚠️ Atención: necesitas aumentar tu tasa de ahorro.")
     
     st.divider()
     
@@ -1365,17 +1673,19 @@ def _render_meta_analysis_result(meta_state: dict):
         # Separar en fijos, variables y discrecionales (aproximación)
         fixed_categories = ['bills_utilities', 'fees']
         variable_categories = ['groceries', 'transportation']
-        discretionary_categories = ['food_dining', 'shopping', 'entertainment']
         
         total_fixed = 0
         total_variable = 0
         total_discretionary = 0
+        total_custom = 0
         
         for cat in categories:
             cat_name = cat.get('category', '')
             spent = cat.get('spent', 0)
             
-            if cat_name in fixed_categories:
+            if _meta_category_is_custom(cat):
+                total_custom += spent
+            elif cat_name in fixed_categories:
                 total_fixed += spent
             elif cat_name in variable_categories:
                 total_variable += spent
@@ -1386,22 +1696,44 @@ def _render_meta_analysis_result(meta_state: dict):
         st.markdown("### 🔴 Gastos Fijos (Obligatorios)")
         fixed_items = [c for c in categories if c.get('category', '') in fixed_categories]
         for item in fixed_items:
-            st.write(f"• **{item.get('category', '').replace('_', ' ').title()}**: ${item.get('spent', 0):.2f}")
-        st.write(f"**Total fijos:** ${total_fixed:.2f} ({total_fixed/expenses*100:.0f}% de gastos)")
+            st.write(f"• **{_meta_category_label(item)}**: ${item.get('spent', 0):.2f}")
+        fixed_pct = (total_fixed / expenses * 100) if expenses else 0.0
+        st.write(f"**Total fijos:** ${total_fixed:.2f} ({fixed_pct:.0f}% de gastos)")
         
         st.markdown("### 🟡 Gastos Variables (Necesarios)")
         variable_items = [c for c in categories if c.get('category', '') in variable_categories]
         for item in variable_items:
-            st.write(f"• **{item.get('category', '').replace('_', ' ').title()}**: ${item.get('spent', 0):.2f}")
-        st.write(f"**Total variables:** ${total_variable:.2f} ({total_variable/expenses*100:.0f}% de gastos)")
+            st.write(f"• **{_meta_category_label(item)}**: ${item.get('spent', 0):.2f}")
+        variable_pct = (total_variable / expenses * 100) if expenses else 0.0
+        st.write(f"**Total variables:** ${total_variable:.2f} ({variable_pct:.0f}% de gastos)")
         
         st.markdown("### 🔵 Gastos Discrecionales (Optimizable)")
-        discretionary_items = [c for c in categories if c.get('category', '') not in fixed_categories + variable_categories]
+        discretionary_items = [
+            c for c in categories
+            if c.get('category', '') not in fixed_categories + variable_categories
+            and not _meta_category_is_custom(c)
+        ]
         for item in discretionary_items:
-            st.write(f"• **{item.get('category', '').replace('_', ' ').title()}**: ${item.get('spent', 0):.2f}")
-        st.write(f"**Total discrecional:** ${total_discretionary:.2f} ({total_discretionary/expenses*100:.0f}% de gastos)")
+            st.write(f"• **{_meta_category_label(item)}**: ${item.get('spent', 0):.2f}")
+        discretionary_pct = (total_discretionary / expenses * 100) if expenses else 0.0
+        st.write(f"**Total discrecional:** ${total_discretionary:.2f} ({discretionary_pct:.0f}% de gastos)")
+
+        custom_items = [c for c in categories if _meta_category_is_custom(c)]
+        if custom_items:
+            st.markdown("### 🟣 Categorías Personalizadas (Seguimiento)")
+            for item in custom_items:
+                st.write(f"• **{_meta_category_label(item)}**: ${item.get('spent', 0):.2f}")
+            custom_pct = (total_custom / expenses * 100) if expenses else 0.0
+            st.write(
+                f"**Total personalizado:** ${total_custom:.2f} "
+                f"({custom_pct:.0f}% de gastos)"
+            )
+            st.caption(
+                "Estas categorías se muestran por decisión del usuario y no se "
+                "clasifican automáticamente como fijas, variables o discrecionales."
+            )
         
-        if total_discretionary / expenses > 0.25:
+        if expenses and total_discretionary / expenses > 0.25:
             st.warning("⚠️ **Alto gasto discrecional**: Aquí está el principal potencial de optimización.")
     
     st.divider()
@@ -1415,39 +1747,51 @@ def _render_meta_analysis_result(meta_state: dict):
         
         with col1:
             if 'savings_rate' in ratios:
-                sr = ratios['savings_rate'].get('value', 0)
-                st.write(f"**Tasa de Ahorro:** {sr*100:.1f}%")
-                if sr > 0.20:
-                    st.success("✔️ Muy buena (ideal >20%)")
-                elif sr > 0.10:
-                    st.info("✔️ Aceptable")
+                sr = _normalize_ratio_value(ratios['savings_rate'].get('value', 0))
+                if sr is None:
+                    st.write("**Tasa de Ahorro:** N/D")
                 else:
-                    st.warning("⚠️ Por debajo del ideal")
+                    st.write(f"**Tasa de Ahorro:** {sr*100:.1f}%")
+                    if sr > 0.20:
+                        st.success("✔️ Muy buena (ideal >20%)")
+                    elif sr > 0.10:
+                        st.info("✔️ Aceptable")
+                    else:
+                        st.warning("⚠️ Por debajo del ideal")
             
             if 'housing_ratio' in ratios:
-                hr = ratios['housing_ratio'].get('value', 0)
-                st.write(f"**Carga de Vivienda:** {hr*100:.1f}%")
-                if hr < 0.30:
-                    st.success("✔️ Saludable (<30%)")
+                hr = _normalize_ratio_value(ratios['housing_ratio'].get('value', 0))
+                if hr is None:
+                    st.write("**Carga de Vivienda:** N/D")
                 else:
-                    st.warning("⚠️ Elevado (>30%)")
+                    st.write(f"**Carga de Vivienda:** {hr*100:.1f}%")
+                    if hr < 0.30:
+                        st.success("✔️ Saludable (<30%)")
+                    else:
+                        st.warning("⚠️ Elevado (>30%)")
         
         with col2:
             if 'debt_ratio' in ratios:
-                dr = ratios['debt_ratio'].get('value', 0)
-                st.write(f"**Ratio Deuda/Ingreso:** {dr*100:.1f}%")
-                if dr < 0.15:
-                    st.success("✔️ Bajo → buena capacidad financiera")
+                dr = _normalize_ratio_value(ratios['debt_ratio'].get('value', 0))
+                if dr is None:
+                    st.write("**Ratio Deuda/Ingreso:** N/D")
                 else:
-                    st.warning("⚠️ Moderado a alto")
+                    st.write(f"**Ratio Deuda/Ingreso:** {dr*100:.1f}%")
+                    if dr < 0.15:
+                        st.success("✔️ Bajo → buena capacidad financiera")
+                    else:
+                        st.warning("⚠️ Moderado a alto")
             
             if 'discretionary_ratio' in ratios:
-                disr = ratios['discretionary_ratio'].get('value', 0)
-                st.write(f"**Gasto Discrecional:** {disr*100:.1f}%")
-                if disr < 0.20:
-                    st.success("✔️ Controlado")
+                disr = _normalize_ratio_value(ratios['discretionary_ratio'].get('value', 0))
+                if disr is None:
+                    st.write("**Gasto Discrecional:** N/D")
                 else:
-                    st.warning("⚠️ Elevado - oportunidad de optimización")
+                    st.write(f"**Gasto Discrecional:** {disr*100:.1f}%")
+                    if disr < 0.20:
+                        st.success("✔️ Controlado")
+                    else:
+                        st.warning("⚠️ Elevado - oportunidad de optimización")
     
     st.divider()
     
@@ -1562,6 +1906,12 @@ def initialize_session_state():
     if 'generate_ai_insights' not in st.session_state:
         st.session_state.generate_ai_insights = False
 
+    if 'custom_category_labels' not in st.session_state:
+        st.session_state.custom_category_labels = default_custom_category_labels()
+
+    if 'session_instance_id' not in st.session_state:
+        st.session_state.session_instance_id = uuid.uuid4().hex
+
     if 'meta_analysis_result' not in st.session_state:
         _clear_meta_analysis_state()
 
@@ -1572,7 +1922,7 @@ def main():
     """Main Streamlit application"""
 
     st.set_page_config(
-        page_title="Analizador de cartolas",
+        page_title="Analizador de estados de cuenta",
         page_icon="🏦",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -1580,7 +1930,7 @@ def main():
 
     initialize_session_state()
 
-    st.title("🏦 Analizador de cartolas")
+    st.title("🏦 Analizador de estados de cuenta")
     st.subheader("Sistema híbrido de análisis financiero multiagente")
     st.warning("⚠️ **Solo para fines educativos** - No lo uses con datos financieros reales que contengan información sensible")
 
@@ -1607,7 +1957,7 @@ def main():
         st.divider()
         workspace_mode = st.radio(
             "Módulo",
-            ["Análisis de cartola", "Problemas cotidianos"],
+            ["Análisis de estado de cuenta", "Problemas cotidianos"],
             index=0,
             help="Selecciona entre análisis de estados de cuenta y resolución de problemas financieros cotidianos",
         )
@@ -1632,6 +1982,27 @@ def main():
             st.error("❌ Falló la inicialización del sistema")
             st.write("Verifica que tu archivo .env contenga OPENAI_API_KEY")
 
+        st.divider()
+        st.subheader("Privacidad de la sesión")
+        confirm_session_reset = st.checkbox(
+            "Confirmo que deseo borrar la sesión",
+            key="confirm_session_reset",
+        )
+        if st.button(
+            "🧹 Finalizar sesión y borrar datos",
+            use_container_width=True,
+            disabled=not confirm_session_reset,
+            help=(
+                "Borra inmediatamente estados de cuenta, resultados, filtros, nombres auxiliares "
+                "y asignaciones temporales. Las reglas financieras aprendidas se conservan."
+            ),
+        ):
+            st.session_state.clear()
+            # Give stateful widgets new identities so the browser cannot
+            # repopulate the just-cleared upload/editor values on rerun.
+            st.session_state.session_instance_id = uuid.uuid4().hex
+            st.rerun()
+
     if workspace_mode == "Problemas cotidianos":
         render_problem_solver_page()
         return
@@ -1640,13 +2011,14 @@ def main():
         st.error("El sistema no está inicializado. Verifica la configuración de tu clave API.")
         return
 
-    st.header("📄 Sube tus cartolas bancarias")
+    st.header("📄 Sube tus estados de cuenta bancarios")
 
     uploaded_files = st.file_uploader(
-        "Elige uno o más archivos PDF de cartolas bancarias",
+        "Elige uno o más archivos PDF de estados de cuenta bancarios",
         type=['pdf'],
         accept_multiple_files=True,
-        help="Sube una o varias cartolas para un análisis consolidado",
+        help="Sube uno o varios estados de cuenta para un análisis consolidado",
+        key=f"statement_uploader_{st.session_state.session_instance_id}",
     )
 
     if uploaded_files:
@@ -1671,16 +2043,16 @@ def main():
             else:
                 st.info("📊 Modo determinístico + categorización mínima con LLM")
 
-        if st.button("🚀 Analizar cartolas", type="primary", use_container_width=True):
+        if st.button("🚀 Analizar estados de cuenta", type="primary", use_container_width=True):
             process_uploaded_files(statement_inputs, generate_insights)
 
         if st.session_state.analysis_result:
             show_debug_diagnostics(st.session_state.analysis_result)
             display_results(st.session_state.analysis_result)
     else:
-        st.info("👆 Sube un PDF de cartola bancaria para comenzar el análisis")
+        st.info("👆 Sube un PDF de estado de cuenta bancario para comenzar el análisis")
         st.subheader("📋 Archivos de ejemplo disponibles")
-        st.write("Puedes probar con estas cartolas de ejemplo:")
+        st.write("Puedes probar con estos estados de cuenta de ejemplo:")
         sample_files = [
             "chase_statement.pdf - formato Chase Bank",
             "Sample Bank Statement.pdf - formato genérico",
@@ -1786,10 +2158,19 @@ def display_results(result: dict):
     
     st.header("📊 Resultados del análisis financiero")
 
+    flash_message = st.session_state.pop('category_flash_message', None)
+    if flash_message:
+        st.success(flash_message)
+
+    _render_custom_category_manager(result)
+
     all_transactions = result.get('transactions', [])
     available_persons = sorted({t.get('person', '') for t in all_transactions if t.get('person')})
     available_months = sorted({t.get('month', '') for t in all_transactions if t.get('month')})
     available_docs = sorted({t.get('source_file_name', '') for t in all_transactions if t.get('source_file_name')})
+    available_categories = sorted({
+        t.get('category', 'other') for t in all_transactions if t.get('category')
+    })
     parsed_dates = [
         parsed_date
         for parsed_date in (_parse_transaction_date(t.get('date')) for t in all_transactions)
@@ -1798,13 +2179,20 @@ def display_results(result: dict):
     default_start_date = min(parsed_dates) if parsed_dates else date.today()
     default_end_date = max(parsed_dates) if parsed_dates else date.today()
 
-    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
     with filter_col1:
         person_filter = st.selectbox("Persona", ["Todos"] + available_persons, key="results_filter_person")
     with filter_col2:
         document_filter = st.selectbox("Documento", ["Todos"] + available_docs, key="results_filter_document")
     with filter_col3:
         period_mode = st.selectbox("Periodo", ["Todos", "Mes", "Rango de fechas"], key="results_filter_period_mode")
+    with filter_col4:
+        category_filter = st.selectbox(
+            "Categoría",
+            ["__all__"] + available_categories,
+            format_func=lambda code: "Todas" if code == "__all__" else _category_code_to_label(code),
+            key="results_filter_category",
+        )
 
     month_filter = "Todos"
     date_range = None
@@ -1819,7 +2207,15 @@ def display_results(result: dict):
             else:
                 date_range = (start_date, end_date)
 
-    filtered_transactions = _filter_transactions(all_transactions, person_filter, month_filter, document_filter, date_filter_mode=period_mode, date_range=date_range)
+    filtered_transactions = _filter_transactions(
+        all_transactions,
+        person_filter,
+        month_filter,
+        document_filter,
+        category_filter=category_filter,
+        date_filter_mode=period_mode,
+        date_range=date_range,
+    )
     if not filtered_transactions and all_transactions:
         st.warning("No hay transacciones para la combinación de filtros seleccionada.")
 
@@ -1843,7 +2239,14 @@ def display_results(result: dict):
     monthly_trends = analyzer.compute_monthly_trends(monthly_summary) if analyzer and monthly_summary else {}
     if monthly_summary:
         st.subheader("🗓️ Consolidación mensual (periodo visible)")
-        month_df = pd.DataFrame(monthly_summary)
+        display_monthly_summary = copy.deepcopy(monthly_summary)
+        for month_row in display_monthly_summary:
+            by_category = month_row.get('by_category', {})
+            month_row['by_category'] = {
+                _category_code_to_label(code): amount
+                for code, amount in by_category.items()
+            }
+        month_df = pd.DataFrame(display_monthly_summary)
         if not month_df.empty:
             st.dataframe(month_df[['month', 'total_income', 'total_spent', 'net_change', 'transaction_count']], use_container_width=True, hide_index=True)
 
@@ -1860,7 +2263,7 @@ def display_results(result: dict):
             spending_totals = {}
             for txn in filtered_transactions:
                 if txn.get('is_debit') and txn.get('effective_is_spending', True):
-                    category_label = txn['category'].replace('_', ' ').title()
+                    category_label = _category_code_to_label(txn['category'])
                     spending_totals[category_label] = spending_totals.get(category_label, 0.0) + float(txn['amount'])
 
             if not spending_totals:
@@ -1899,7 +2302,7 @@ def display_results(result: dict):
                 rows = []
                 for cat, amount in totals.items():
                     pct = (amount / total_spent_filtered * 100) if total_spent_filtered > 0 else 0.0
-                    rows.append({'Category': cat.replace('_', ' ').title(), 'Amount': amount, 'Percentage': pct, 'Count': counts.get(cat, 0)})
+                    rows.append({'Category': _category_code_to_label(cat), 'Amount': amount, 'Percentage': pct, 'Count': counts.get(cat, 0)})
 
                 df_categories = pd.DataFrame(rows).sort_values('Amount', ascending=False).head(6)
                 fig_bar = px.bar(df_categories, x='Category', y='Amount', title="Principales categorías por monto", text='Amount', color='Percentage', color_continuous_scale='Viridis')
@@ -1929,7 +2332,7 @@ def display_results(result: dict):
 
             if filtered_transactions:
                 df_transactions = _transactions_to_editor_df(filtered_transactions)
-                category_labels = [_category_code_to_label(code) for code in CATEGORY_CODES if code != 'uncategorized']
+                category_labels = _selectable_category_labels()
 
                 edited_df = st.data_editor(
                     df_transactions,
@@ -1938,6 +2341,7 @@ def display_results(result: dict):
                     key='transactions_editor',
                     column_config={
                         '_txn_index': None,
+                        'Select': st.column_config.CheckboxColumn('Select', default=False),
                         'Amount': st.column_config.NumberColumn('Amount', format='$%.2f', disabled=True),
                         'Date': st.column_config.TextColumn('Date', disabled=True),
                         'Month': st.column_config.TextColumn('Month', disabled=True),
@@ -1954,7 +2358,34 @@ def display_results(result: dict):
                     },
                 )
 
-                if st.button("🔄 Actualizar informe con categorías manuales", type="secondary", use_container_width=True):
+                bulk_col1, bulk_col2 = st.columns([2, 1])
+                with bulk_col1:
+                    bulk_category = st.selectbox(
+                        "Categoría para filas seleccionadas",
+                        category_labels,
+                        key="bulk_category_choice",
+                    )
+                with bulk_col2:
+                    st.write("")
+                    st.write("")
+                    if st.button(
+                        "Aplicar a seleccionadas",
+                        type="secondary",
+                        use_container_width=True,
+                    ):
+                        selected_mask = edited_df['Select'].fillna(False).astype(bool)
+                        if not selected_mask.any():
+                            st.warning("Selecciona al menos una transacción.")
+                        else:
+                            bulk_edited_df = edited_df.copy()
+                            bulk_edited_df.loc[selected_mask, 'Category'] = bulk_category
+                            _apply_manual_category_updates(result, bulk_edited_df)
+
+                if st.button(
+                    "🔄 Actualizar informe con categorías manuales",
+                    type="secondary",
+                    use_container_width=True,
+                ):
                     _apply_manual_category_updates(result, edited_df)
             else:
                 st.info("No hay transacciones que coincidan con los filtros actuales.")
@@ -1991,60 +2422,66 @@ def display_results(result: dict):
 
 
 def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
-    """Apply manual category edits, persist learned rules, and recompute full analysis."""
+    """Apply edits, learn only standard categories, and recompute the report."""
     updated_transactions = copy.deepcopy(result['transactions'])
     changed_rows = 0
     rules_saved = 0
+    rejected_custom_rows = 0
 
     for _, row in edited_df.iterrows():
         txn_index = int(row['_txn_index'])
+        if txn_index < 0 or txn_index >= len(updated_transactions):
+            continue
         new_category = _category_label_to_code(row['Category'])
-        old_category = updated_transactions[txn_index]['category']
+        transaction = updated_transactions[txn_index]
+        try:
+            changed = assign_effective_category(transaction, new_category)
+        except ValueError:
+            rejected_custom_rows += 1
+            continue
 
-        updated_transactions[txn_index]['category'] = new_category
-
-        if new_category != old_category:
+        if changed:
             changed_rows += 1
-            saved_ok = st.session_state.analyzer.agent1.merchant_db.save_user_category_rule(
-                updated_transactions[txn_index]['description'],
-                new_category
+            if not is_custom_category(new_category):
+                saved_ok = st.session_state.analyzer.agent1.merchant_db.save_user_category_rule(
+                    transaction['description'], new_category
+                )
+                if saved_ok:
+                    rules_saved += 1
+
+    if changed_rows == 0:
+        if rejected_custom_rows:
+            st.warning(
+                "Las categorías personalizadas solo pueden asignarse a transacciones que cuentan como gasto."
             )
-            if saved_ok:
-                rules_saved += 1
+        else:
+            st.info("No hay cambios de categoría para aplicar.")
+        return
 
-    llm_before_calls = st.session_state.analyzer.llm.call_count
-    llm_before_cost = st.session_state.analyzer.llm.total_cost
-
-    # Reset Agent 3 counter only for this refresh run.
-    st.session_state.analyzer.agent3.llm_calls_made = 0
-    updated_analysis = st.session_state.analyzer.agent3.process(
+    updated_result, llm_added_calls, llm_added_cost = _refresh_analysis_result(
+        result,
         updated_transactions,
-        generate_ai_insights=st.session_state.generate_ai_insights
+        generate_ai_insights=st.session_state.generate_ai_insights,
     )
-
-    llm_added_calls = st.session_state.analyzer.llm.call_count - llm_before_calls
-    llm_added_cost = st.session_state.analyzer.llm.total_cost - llm_before_cost
-
-    updated_result = copy.deepcopy(result)
-    updated_result['transactions'] = updated_transactions
-    updated_result['analysis'] = updated_analysis
-    if hasattr(st.session_state.analyzer, 'aggregate_by_month'):
-        updated_result['monthly_summary'] = st.session_state.analyzer.aggregate_by_month(updated_transactions)
-    if hasattr(st.session_state.analyzer, 'compute_monthly_trends'):
-        updated_result['monthly_trends'] = st.session_state.analyzer.compute_monthly_trends(updated_result.get('monthly_summary', []))
-    updated_result['system_metrics']['total_llm_calls'] += max(llm_added_calls, 0)
-    updated_result['system_metrics']['estimated_cost'] += max(llm_added_cost, 0.0)
-    updated_result['system_metrics']['processing_time'] = datetime.now().isoformat()
-    updated_result['system_metrics']['agent_breakdown']['agent3_llm_calls'] += max(llm_added_calls, 0)
 
     st.session_state.analysis_result = updated_result
+    _clear_meta_analysis_state()
 
-    st.success(
-        f"Updated report with {changed_rows} manual category change(s). "
-        f"Saved {rules_saved} learned rule(s) for future statements."
+    message = (
+        f"Informe actualizado con {changed_rows} cambio(s). "
+        f"Se guardaron {rules_saved} regla(s) financieras para futuros estados de cuenta."
     )
+    if rejected_custom_rows:
+        message += (
+            f" Se omitieron {rejected_custom_rows} fila(s) porque las categorías "
+            "personalizadas solo admiten gastos."
+        )
+    st.session_state.category_flash_message = message
     if llm_added_calls > 0:
-        st.info(f"LLM refresh used {llm_added_calls} additional call(s), estimated +${llm_added_cost:.4f}.")
+        st.session_state.category_flash_message += (
+            f" La actualización usó {llm_added_calls} llamada(s) LLM adicional(es), "
+            f"con costo estimado de +${llm_added_cost:.4f}."
+        )
 
     st.rerun()
 

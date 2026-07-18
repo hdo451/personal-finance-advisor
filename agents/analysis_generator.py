@@ -13,6 +13,7 @@ import re
 from typing import List, Dict, Optional
 from datetime import datetime
 from .base_agent import BaseAgent
+from utils.custom_categories import is_custom_category, resolve_category_label
 
 class AnalysisGeneratorAgent(BaseAgent):
     """
@@ -25,7 +26,12 @@ class AnalysisGeneratorAgent(BaseAgent):
         self.llm = llm_interface
         print(f"📊 {self.name} initialized - {'with' if llm_interface else 'without'} LLM capability")
     
-    def process(self, transactions: List[Dict], generate_ai_insights: bool = False) -> Dict:
+    def process(
+        self,
+        transactions: List[Dict],
+        generate_ai_insights: bool = False,
+        category_labels: Optional[Dict[str, str]] = None,
+    ) -> Dict:
         """
         Generate comprehensive financial analysis
         
@@ -42,10 +48,10 @@ class AnalysisGeneratorAgent(BaseAgent):
         summary = self._calculate_financial_summary(transactions)
         
         # Step 2: Analyze spending by category (deterministic)
-        category_analysis = self._analyze_spending_by_category(transactions)
+        category_analysis = self._analyze_spending_by_category(transactions, category_labels)
         
         # Step 3: Find spending patterns (deterministic)
-        patterns = self._identify_spending_patterns(transactions)
+        patterns = self._identify_spending_patterns(transactions, category_labels)
         
         # Step 4: Generate basic insights (deterministic)
         basic_insights = self._generate_basic_insights(summary, category_analysis)
@@ -98,7 +104,11 @@ class AnalysisGeneratorAgent(BaseAgent):
             'credit_count': len(credits)
         }
     
-    def _analyze_spending_by_category(self, transactions: List[Dict]) -> List[Dict]:
+    def _analyze_spending_by_category(
+        self,
+        transactions: List[Dict],
+        category_labels: Optional[Dict[str, str]] = None,
+    ) -> List[Dict]:
         """Analyze spending breakdown by category (deterministic)"""
         print("   🏷️ Analyzing spending by category...")
         
@@ -132,6 +142,8 @@ class AnalysisGeneratorAgent(BaseAgent):
             
             category_analysis.append({
                 'category': category,
+                'category_label': resolve_category_label(category, category_labels),
+                'category_type': 'user_custom' if is_custom_category(category) else 'system',
                 'total': total,
                 'percentage': percentage,
                 'transaction_count': category_counts[category],
@@ -146,7 +158,11 @@ class AnalysisGeneratorAgent(BaseAgent):
         # Sort by total spending (highest first)
         return sorted(category_analysis, key=lambda x: x['total'], reverse=True)
     
-    def _identify_spending_patterns(self, transactions: List[Dict]) -> Dict:
+    def _identify_spending_patterns(
+        self,
+        transactions: List[Dict],
+        category_labels: Optional[Dict[str, str]] = None,
+    ) -> Dict:
         """Identify interesting spending patterns (deterministic)"""
         print("   🔍 Identifying spending patterns...")
         
@@ -180,7 +196,15 @@ class AnalysisGeneratorAgent(BaseAgent):
                 'description': largest_transaction['description'],
                 'amount': largest_transaction['amount'],
                 'date': largest_transaction['date'],
-                'category': largest_transaction['category']
+                'category': largest_transaction['category'],
+                'category_label': resolve_category_label(
+                    largest_transaction['category'], category_labels
+                ),
+                'category_type': (
+                    'user_custom'
+                    if is_custom_category(largest_transaction['category'])
+                    else 'system'
+                ),
             },
             'unique_merchants': len(merchant_totals),
             'average_transactions_per_day': len(debit_transactions) / 30
@@ -207,10 +231,11 @@ class AnalysisGeneratorAgent(BaseAgent):
         # Category insights
         if category_analysis:
             top_category = category_analysis[0]
-            insights.append(f"Your top spending category is {top_category['category']} at {top_category['percentage']:.1f}% of total")
+            top_label = top_category.get('category_label', top_category['category'])
+            insights.append(f"Your top spending category is {top_label} at {top_category['percentage']:.1f}% of total")
             
             if top_category['percentage'] > 30:
-                insights.append(f"⚠️ {top_category['category']} represents a large portion of your spending")
+                insights.append(f"⚠️ {top_label} represents a large portion of your spending")
         
         # Income vs spending
         if summary['net_change'] > 0:
@@ -241,6 +266,8 @@ Focus on:
 2. Budget allocation suggestions
 3. Specific actionable recommendations
 
+Categories marked category_type=user_custom are temporary reporting buckets chosen by the user. Do not infer whether they are fixed, variable, discretionary, unnecessary, or reducible solely from their label. Do not treat them as learned merchant categories.
+
 Keep insights concise and practical."""
 
         user_prompt = f"Analyze this spending data and provide personalized insights:\n{json.dumps(analysis_data, indent=2)}"
@@ -269,7 +296,7 @@ Keep insights concise and practical."""
         print(f"   📊 Net Change: ${summary['net_change']:.2f}")
         
         if categories:
-            print(f"   🏆 Top Category: {categories[0]['category']} ({categories[0]['percentage']:.1f}%)")
+            top_label = categories[0].get('category_label', categories[0]['category'])
+            print(f"   🏆 Top Category: {top_label} ({categories[0]['percentage']:.1f}%)")
         
         print(f"   🤖 LLM calls made: {self.llm_calls_made}")
-        

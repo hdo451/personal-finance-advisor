@@ -1,7 +1,7 @@
 import pdfplumber
 import re
-from datetime import datetime
-from typing import List, Dict, Optional
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Tuple
 from .base_agent import BaseAgent
 from utils.merchant_database import MerchantDatabase
 
@@ -14,6 +14,7 @@ class DocumentProcessorAgent(BaseAgent):
     def __init__(self):
         super().__init__("Document Processor", uses_llm=False)
         self.merchant_db = MerchantDatabase()
+        self._statement_date_range_hint: Optional[Tuple[datetime, datetime]] = None
         print(f"🏗️ {self.name} initialized - 0 LLM calls")
 
     def process(self, pdf_path: str) -> Dict:
@@ -26,6 +27,8 @@ class DocumentProcessorAgent(BaseAgent):
             
             if not raw_text.strip():
                 return {'success': False, 'error': 'No text in PDF', 'transactions': []}
+
+            self._statement_date_range_hint = self._infer_statement_date_range(raw_text)
             
             print(f"   ✅ Extracted {len(raw_text)} characters")
             
@@ -49,7 +52,10 @@ class DocumentProcessorAgent(BaseAgent):
                 'success': True,
                 'transactions': categorized_transactions,  # Changed from parsed_transactions
                 'total_transactions': len(categorized_transactions),
-                'raw_transaction_lines': transaction_lines,
+                'raw_transaction_lines': [
+                    item.get('text', '') if isinstance(item, dict) else str(item)
+                    for item in transaction_lines
+                ],
                 'parsing_stats': {
                     'lines_found': len(transaction_lines),
                     'successfully_parsed': len(parsed_transactions),
@@ -110,53 +116,226 @@ class DocumentProcessorAgent(BaseAgent):
             
             return full_text
     
-    def _find_transaction_lines(self, text: str) -> List[str]:
+    def _find_transaction_lines(self, text: str) -> List[Dict]:
         """
-        Find Lines that actually contain transactions
-        Only processes transactions after "TRANSACTION DETAIL" marker to avoid header/footer noise
+        Find transaction lines while retaining page, extraction source, and
+        statement-section context.
+
+        Page text is preferred when available. Table rows are used only as a
+        fallback for pages whose text layer yields no transactions. This avoids
+        counting the same transaction once from a table and again from text,
+        while preserving legitimate repeated rows within the selected source.
         """
-        lines = text.split('\n')
-        
-        # Find the marker where actual transactions begin
-        transaction_start_idx = 0
-        for i, line in enumerate(lines):
-            if 'transaction detail' in line.lower() or 'detail de transacciones' in line.lower():
-                transaction_start_idx = i
-                print(f"   📍 Found transaction block at line {i+1}")
-                break
-        
-        # Process only from that point forward
-        lines_to_scan = lines[transaction_start_idx:]
-        
-        potential_transactions = []
-        seen_lines = set()  # Deduplicate transactions
+        page_text_blocks: Dict[int, str] = {}
+        page_table_blocks: Dict[int, List[str]] = {}
 
-        print(f"   🔍 Scanning {len(lines_to_scan)} lines for transactions...")
+        for match in re.finditer(
+            r'--- PAGE (\d+) TEXT ---\s*(.*?)\s*--- END PAGE \1 TEXT ---',
+            text,
+            re.DOTALL,
+        ):
+            page_text_blocks[int(match.group(1))] = match.group(2)
 
-        for line_num, line in enumerate(lines_to_scan, transaction_start_idx + 1):
-            line = line.strip()
+        for match in re.finditer(
+            r'--- PAGE (\d+) TABLE \d+ ---\s*(.*?)\s*--- END TABLE \d+ ---',
+            text,
+            re.DOTALL,
+        ):
+            page_table_blocks.setdefault(int(match.group(1)), []).append(match.group(2))
 
-            # Skip empty lines
-            if not line:
-                continue
+        has_transaction_marker = any(
+            marker in text.lower()
+            for marker in ('transaction detail', 'detail de transacciones')
+        )
+        scan_enabled = not has_transaction_marker
+        current_section: Optional[str] = None
+        current_section_label = ''
+        potential_transactions: List[Dict] = []
 
-            # Skip obvious non-transaction lines
-            if self._is_header_or_footer(line):
-                continue
+        if page_text_blocks or page_table_blocks:
+            pages = sorted(set(page_text_blocks) | set(page_table_blocks))
+            total_lines = sum(
+                len(page_text_blocks.get(page, '').splitlines())
+                for page in pages
+            )
+            print(f"   🔍 Scanning {total_lines} page-text lines for transactions...")
 
-            # Check if this looks like a transaction
-            if self._looks_like_transaction(line):
-                # Deduplicate by storing hash of line
-                line_hash = hash(line)
-                if line_hash not in seen_lines:
-                    seen_lines.add(line_hash)
-                    potential_transactions.append(line)
-                    print(f"   ✅ Line {line_num}: {line[:50]}...")
-                else:
-                    print(f"   ⏭️  Line {line_num}: Duplicate, skipping")
+            for page_num in pages:
+                page_start_section = current_section
+                page_start_label = current_section_label
+                page_start_enabled = scan_enabled
+
+                text_candidates, current_section, current_section_label, scan_enabled = (
+                    self._scan_transaction_block(
+                        page_text_blocks.get(page_num, ''),
+                        page_num=page_num,
+                        source='page_text',
+                        current_section=current_section,
+                        current_section_label=current_section_label,
+                        scan_enabled=scan_enabled,
+                    )
+                )
+
+                if text_candidates:
+                    potential_transactions.extend(text_candidates)
+                    continue
+
+                table_candidates: List[Dict] = []
+                table_section = page_start_section
+                table_label = page_start_label
+                table_enabled = page_start_enabled
+                for table_text in page_table_blocks.get(page_num, []):
+                    found, table_section, table_label, table_enabled = (
+                        self._scan_transaction_block(
+                            table_text,
+                            page_num=page_num,
+                            source='table',
+                            current_section=table_section,
+                            current_section_label=table_label,
+                            scan_enabled=table_enabled,
+                        )
+                    )
+                    table_candidates.extend(found)
+                potential_transactions.extend(table_candidates)
+        else:
+            print(f"   🔍 Scanning {len(text.splitlines())} lines for transactions...")
+            found, _, _, _ = self._scan_transaction_block(
+                text,
+                page_num=None,
+                source='plain_text',
+                current_section=None,
+                current_section_label='',
+                scan_enabled=scan_enabled,
+            )
+            potential_transactions.extend(found)
 
         print(f"   📊 Found {len(potential_transactions)} potential transaction lines")
         return potential_transactions
+
+    def _scan_transaction_block(
+        self,
+        block_text: str,
+        page_num: Optional[int],
+        source: str,
+        current_section: Optional[str],
+        current_section_label: str,
+        scan_enabled: bool,
+    ) -> Tuple[List[Dict], Optional[str], str, bool]:
+        """Scan one ordered text block and carry section state forward."""
+        candidates: List[Dict] = []
+
+        for line_num, raw_line in enumerate(block_text.splitlines(), 1):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            line_lower = line.lower()
+            if 'transaction detail' in line_lower or 'detail de transacciones' in line_lower:
+                scan_enabled = True
+                print(f"   📍 Found transaction block on page {page_num or '?'}")
+
+            section_event = self._detect_section_event(line)
+            if section_event:
+                event_type, section_code, section_label = section_event
+                if event_type == 'end':
+                    current_section = None
+                    current_section_label = ''
+                else:
+                    current_section = section_code
+                    current_section_label = section_label
+                continue
+
+            if not scan_enabled:
+                continue
+            if self._is_header_or_footer(line):
+                continue
+            if not self._looks_like_transaction(line):
+                continue
+
+            candidates.append({
+                'text': line,
+                'page': page_num,
+                'source': source,
+                'statement_section': current_section,
+                'section_label': current_section_label,
+                'source_line_number': line_num,
+            })
+            print(
+                f"   ✅ Page {page_num or '?'} line {line_num}: "
+                f"{line[:50]}..."
+            )
+
+        return candidates, current_section, current_section_label, scan_enabled
+
+    def _detect_section_event(self, line: str) -> Optional[Tuple[str, Optional[str], str]]:
+        """Recognize deterministic credit/debit section boundaries."""
+        normalized = re.sub(r'^ROW_\d+:\s*', '', line, flags=re.IGNORECASE)
+        normalized = re.sub(r'^[^A-Za-zÀ-ÿ]+', '', normalized)
+        normalized = re.sub(r'\s+', ' ', normalized).strip().rstrip(':').casefold()
+
+        if normalized.startswith('total'):
+            total_label = re.sub(
+                r'\s*(?:=)?\s*\$?[\d.,]+\s*$',
+                '',
+                normalized[5:].lstrip(),
+            ).strip()
+            if self._matches_credit_section_header(total_label):
+                return ('end', None, '')
+            if self._matches_debit_section_header(total_label):
+                return ('end', None, '')
+
+        if self._matches_credit_section_header(normalized):
+            return ('start', 'deposits_credits_interest', normalized)
+        if self._matches_debit_section_header(normalized):
+            return ('start', 'withdrawals_debits_charges', normalized)
+        return None
+
+    def _matches_credit_section_header(self, normalized: str) -> bool:
+        patterns = [
+            r'deposits?,? credits? and interest',
+            r'deposits? and (?:other )?credits?',
+            r'credits? and deposits?',
+            r'deposits?\s*/\s*credits?',
+            r'credits?\s*/\s*deposits?',
+            r'dep[oó]sitos?,? abonos? e intereses?',
+            r'dep[oó]sitos? y (?:otros )?cr[eé]ditos?',
+            r'abonos? y dep[oó]sitos?',
+        ]
+        if any(re.fullmatch(pattern, normalized) for pattern in patterns):
+            return True
+
+        compact = re.sub(r'[^a-zà-ÿ]+', '', normalized.casefold())
+        compact_patterns = [
+            r'deposits?credits?andinterest',
+            r'deposits?and(?:other)?credits?',
+            r'credits?anddeposits?',
+            r'dep[oó]sitos?abonos?eintereses?',
+            r'dep[oó]sitos?y(?:otros)?cr[eé]ditos?',
+            r'abonos?ydep[oó]sitos?',
+        ]
+        return any(re.fullmatch(pattern, compact) for pattern in compact_patterns)
+
+    def _matches_debit_section_header(self, normalized: str) -> bool:
+        patterns = [
+            r'other withdrawals?,? debits? and service charges?',
+            r'withdrawals? and (?:other )?debits?',
+            r'withdrawals?\s*/\s*debits?',
+            r'debits?\s*/\s*withdrawals?',
+            r'retiros?,? cargos? y comisiones?',
+            r'otros retiros?,? d[eé]bitos? y cargos? por servicio',
+        ]
+        if any(re.fullmatch(pattern, normalized) for pattern in patterns):
+            return True
+
+        compact = re.sub(r'[^a-zà-ÿ]+', '', normalized.casefold())
+        compact_patterns = [
+            r'otherwithdrawals?debits?andservicecharges?',
+            r'withdrawals?and(?:other)?debits?',
+            r'debits?andwithdrawals?',
+            r'retiros?cargos?ycomisiones?',
+            r'otrosretiros?d[eé]bitos?ycargos?porservicio',
+        ]
+        return any(re.fullmatch(pattern, compact) for pattern in compact_patterns)
     
     def _is_header_or_footer(self, line: str) -> bool:
         """Skip lines that are obviously NOT transactions"""
@@ -167,7 +346,7 @@ class DocumentProcessorAgent(BaseAgent):
             r'(account|statement|balance information|date|description|amount|type)',
             r'(cartola|cuenta|saldo anterior|saldo final|saldo inicial|fecha|descripcion|descripci[oó]n|monto|abono|cargo)',
             r'(page \d+|statement period|issue date)',
-            r'(opening balance|previous balance|ending balance|current balance|closing balance)',
+            r'(opening balance|previous balance|new balance|ending balance|current balance|closing balance)',
             # Note: Interest earned DEPOSITS are kept if they have amount; fees are kept too
             r'(interest paid)',  # Skip only interest PAID (fees/charges)
             r'(note:|total|summary)',
@@ -202,7 +381,7 @@ class DocumentProcessorAgent(BaseAgent):
         
         return has_date and has_amount and has_description
     
-    def _parse_transaction_lines(self, transaction_lines: List[str]) -> List[Dict]:
+    def _parse_transaction_lines(self, transaction_lines: List) -> List[Dict]:
         """
         Parse each transaction line into structured data
         """
@@ -211,10 +390,31 @@ class DocumentProcessorAgent(BaseAgent):
         parsed_transactions = []
         failed_parses = 0
         
-        for line_num, line in enumerate(transaction_lines, 1):
+        for line_num, candidate in enumerate(transaction_lines, 1):
+            if isinstance(candidate, dict):
+                line = str(candidate.get('text', ''))
+                statement_section = candidate.get('statement_section')
+            else:
+                line = str(candidate)
+                statement_section = None
             try:
                 parsed = self._parse_single_transaction(line)
                 if parsed:
+                    if statement_section == 'deposits_credits_interest':
+                        parsed['is_debit'] = False
+                        parsed['direction_source'] = 'section_header'
+                    elif statement_section == 'withdrawals_debits_charges':
+                        parsed['is_debit'] = True
+                        parsed['direction_source'] = 'section_header'
+                    else:
+                        parsed['direction_source'] = 'line_heuristic'
+
+                    if isinstance(candidate, dict):
+                        parsed['statement_section'] = statement_section
+                        parsed['section_label'] = candidate.get('section_label', '')
+                        parsed['source_page'] = candidate.get('page')
+                        parsed['extraction_source'] = candidate.get('source')
+
                     parsed['transaction_id'] = f"txn_{len(parsed_transactions) + 1}"
                     parsed_transactions.append(parsed)
                     if line_num <= 3:  # Show first 3 for debugging
@@ -390,6 +590,11 @@ class DocumentProcessorAgent(BaseAgent):
         """Handle different date formats"""
         from datetime import datetime
         
+        if re.fullmatch(r'\d{1,2}[/-]\d{1,2}', date_str):
+            inferred = self._parse_short_date_with_statement_hint(date_str)
+            if inferred:
+                return inferred
+
         date_formats = [
             '%m/%d/%Y',     # 02/01/2024
             '%d/%m/%Y',     # 01/02/2024
@@ -419,6 +624,71 @@ class DocumentProcessorAgent(BaseAgent):
         # Fallback to current date if parsing fails
         print(f"   ⚠️  Couldn't parse date: {date_str}")
         return datetime.now()
+
+    def _infer_statement_date_range(self, text: str) -> Optional[Tuple[datetime, datetime]]:
+        """Infer a statement window from explicit balance/period labels."""
+        date_tokens: List[str] = []
+        label_patterns = [
+            r'previous balance as of\s*(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+            r'new balance as of\s*(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+            r'opening balance as of\s*(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+            r'closing balance as of\s*(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+            r'saldo anterior al\s*(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+            r'saldo final al\s*(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+        ]
+        lowered = text.casefold()
+        for pattern in label_patterns:
+            date_tokens.extend(re.findall(pattern, lowered, flags=re.IGNORECASE))
+
+        dates: List[datetime] = []
+        for token in date_tokens:
+            for fmt in ('%m/%d/%Y', '%m-%d-%Y', '%d/%m/%Y', '%d-%m-%Y'):
+                try:
+                    dates.append(datetime.strptime(token, fmt))
+                    break
+                except ValueError:
+                    continue
+
+        if len(dates) < 2:
+            return None
+        start_date, end_date = min(dates), max(dates)
+        if (end_date - start_date).days > 62:
+            return None
+        print(
+            f"   🗓️ Statement period inferred: "
+            f"{start_date.date()} to {end_date.date()}"
+        )
+        return start_date, end_date
+
+    def _parse_short_date_with_statement_hint(self, date_str: str) -> Optional[datetime]:
+        """Resolve MM/DD vs DD/MM by selecting the candidate inside the statement window."""
+        if not self._statement_date_range_hint:
+            return None
+
+        first, second = [int(part) for part in re.split(r'[/-]', date_str)]
+        start_date, end_date = self._statement_date_range_hint
+        years = sorted({start_date.year, end_date.year})
+        candidates: List[datetime] = []
+
+        for year in years:
+            for month, day in ((first, second), (second, first)):
+                try:
+                    candidate = datetime(year, month, day)
+                except ValueError:
+                    continue
+                if candidate not in candidates:
+                    candidates.append(candidate)
+
+        tolerance_start = start_date - timedelta(days=3)
+        tolerance_end = end_date + timedelta(days=3)
+        in_window = [
+            candidate
+            for candidate in candidates
+            if tolerance_start <= candidate <= tolerance_end
+        ]
+        if not in_window:
+            return None
+        return min(in_window, key=lambda candidate: abs((end_date - candidate).days))
 
     def _parse_amount(self, amount_str: str) -> float:
         """Clean and parse amount string"""
@@ -497,7 +767,18 @@ class DocumentProcessorAgent(BaseAgent):
         categorized_count = 0
         
         for txn in transactions:
-            category, confidence = self.merchant_db.categorize_transaction(txn['description'])
+            if txn.get('statement_section') == 'deposits_credits_interest':
+                txn['is_debit'] = False
+                txn['category'] = 'income'
+                txn['confidence'] = 0.99
+                txn['source'] = 'deterministic_section'
+                categorized_count += 1
+                continue
+
+            category, confidence = self.merchant_db.categorize_transaction(
+                txn['description'],
+                is_debit=txn.get('is_debit')
+            )
             
             if category != 'uncategorized':
                 txn['category'] = category

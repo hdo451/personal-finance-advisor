@@ -145,6 +145,11 @@ class BankStatementAnalyzer:
 
                 for txn in categorized_transactions:
                     self.classify_transaction(txn)
+                    # Preserve the automatic financial classification for audit
+                    # purposes. A later session-only custom choice replaces only
+                    # the effective reporting category.
+                    txn['detected_category'] = txn.get('category') or 'other'
+                    txn['category_source'] = 'automatic'
 
                 all_transactions.extend(categorized_transactions)
                 document_results.append({
@@ -347,6 +352,28 @@ class BankStatementAnalyzer:
         else:
             if is_debit and any(k in desc for k in ['payment', 'pago', 'tarjeta', 'credit card', 'tc']):
                 movement_type = 'possible_card_payment'
+            elif any(k in desc for k in [
+                'online transfer from',
+                'transfer from',
+                'deposit',
+                'direct deposit',
+                'salary',
+                'payroll',
+                'refund',
+                'interest',
+                'abono',
+                'credito',
+                'crédito',
+                'ingreso',
+                'transferencia recibida',
+                'devolucion',
+                'devolución',
+            ]):
+                movement_type = 'income_credit'
+                transaction['effective_is_spending'] = False
+                transaction['effective_is_income'] = True
+                if transaction.get('category') in {'uncategorized', 'other'}:
+                    transaction['category'] = 'income'
             elif not is_debit and any(k in desc for k in ['salary', 'nomina', 'nómina', 'deposit', 'abono']):
                 movement_type = 'income_credit'
             elif is_debit and transaction.get('category') == 'fees':

@@ -2,6 +2,8 @@ import re
 import os
 import json
 
+from utils.custom_categories import CUSTOM_CATEGORY_PREFIX
+
 """
 Merchant Database for Deterministic Categorization
 This handles OBVIOUS transactions that don't need LLM analysis.
@@ -90,6 +92,12 @@ class MerchantDatabase:
                 'doctor', 'dentist', 'hospital', 'clinic', 'health',
                 'farmacia', 'medico', 'dentista', 'clinica', 'isapre', 'fonasa'
             ],
+
+            # These categories use direction-sensitive rules below rather than
+            # ordinary substring matching.
+            'other_income': [],
+            'international_transfer_in': [],
+            'international_transfer_out': [],
             
             'atm_cash': [
                 'atm', 'withdrawal', 'cash advance', 'cash back', 'cashout'
@@ -116,10 +124,11 @@ class MerchantDatabase:
         self.user_category_overrides = self._load_user_category_overrides()
         print(f"   🧠 User category rules: {len(self.user_category_overrides)}")
     
-    def categorize_transaction(self, description: str) -> tuple:
+    def categorize_transaction(self, description: str, is_debit=None) -> tuple:
         """
         Categorize transaction based on merchant description
-        Returns: (category, confidence) or ('uncategorized', 0.0)
+        Returns: (category, confidence) or ('uncategorized', 0.0).
+        Direction-sensitive categories are only applied when is_debit is known.
         """
         desc_lower = description.lower().strip()
         
@@ -129,6 +138,32 @@ class MerchantDatabase:
         # First priority: user-learned overrides from manual review.
         if desc_clean in self.user_category_overrides:
             return self.user_category_overrides[desc_clean], 0.99
+
+        # Require an explicit international-transfer marker and use the parsed
+        # debit/credit direction. This avoids treating ordinary transfers as
+        # international movements.
+        international_transfer_markers = [
+            'international transfer', 'international wire', 'intl transfer',
+            'intl wire', 'wire transfer international', 'swift transfer',
+            'swift payment', 'transferencia internacional', 'giro internacional',
+            'transferencia swift', 'pago swift',
+        ]
+        if any(marker in desc_clean for marker in international_transfer_markers):
+            if is_debit is True:
+                return 'international_transfer_out', 0.95
+            if is_debit is False:
+                return 'international_transfer_in', 0.95
+
+        # Be conservative with residual income: require both a credit and an
+        # explicit alternative-income signal.
+        other_income_markers = [
+            'other income', 'misc income', 'miscellaneous income',
+            'additional income', 'otros ingresos', 'otro ingreso',
+            'ingreso adicional', 'honorarios', 'freelance income',
+            'rental income', 'arriendo recibido',
+        ]
+        if is_debit is False and any(marker in desc_clean for marker in other_income_markers):
+            return 'other_income', 0.90
         
         # Check each category's keywords
         for category, keywords in self.merchant_keywords.items():
@@ -147,6 +182,11 @@ class MerchantDatabase:
         if not description or not category:
             return False
 
+        # User-defined auxiliary categories are deliberately session-only and
+        # must never become merchant-learning rules.
+        if str(category).startswith(CUSTOM_CATEGORY_PREFIX):
+            return False
+
         normalized_desc = self._clean_description_for_matching(description.lower().strip())
         if not normalized_desc:
             return False
@@ -163,7 +203,11 @@ class MerchantDatabase:
             with open(self.user_rules_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                return data
+                return {
+                    description: category
+                    for description, category in data.items()
+                    if not str(category).startswith(CUSTOM_CATEGORY_PREFIX)
+                }
         except Exception:
             return {}
 

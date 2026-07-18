@@ -122,6 +122,12 @@ The software includes a second advisory layer designed to run only after human r
 ### How It Works
 1. Run the standard analysis pipeline (Agents 1-3).
 2. Review and adjust categories in the transaction editor.
+   - Rename any of the three session-only auxiliary categories when a personal
+     tracking bucket is useful (for example, `Hermana enferma`).
+   - Assign a custom category to one expense or select several rows and apply it
+     in bulk.
+   - Custom categories replace the visible financial category for the current
+     report, but never create merchant-learning rules.
 3. Click **Run Meta Analysis** to trigger one additional LLM call.
 4. Review a structured advisory report with:
    - Summary metrics
@@ -136,6 +142,22 @@ The software includes a second advisory layer designed to run only after human r
 - Meta analysis is **manual** (not automatic).
 - Results are tied to the current reviewed report state.
 - Advisory output explicitly warns that expert validation is required.
+- User-defined categories are marked as temporary tracking buckets and are not
+  inferred to be fixed, variable, or discretionary from their names.
+
+### Temporary Custom Categories and Session Privacy
+
+- Every new session starts with `Auxiliar 1`, `Auxiliar 2`, and `Auxiliar 3`.
+- Names and assignments live only in Streamlit session state; no custom-category
+  configuration or assignment is written to disk.
+- An auxiliary category appears in reports only after at least one effective
+  spending transaction is assigned to it.
+- The original automatic category is retained internally for traceability, but
+  it is not double-counted in the visible report.
+- **Finalizar sesión y borrar datos** immediately clears uploaded-statement
+  results, filters, custom names, assignments, and advisory state.
+- Only corrections to standard financial categories may persist as normalized
+  merchant rules in `data/user_category_rules.json`.
 
 ### Cost Model
 - Base analysis: existing cost from Agent flow.
@@ -248,10 +270,13 @@ Finances_Advisor/
 ├── utils/                        # Shared utilities
 │   ├── llm_interface.py          # AI management
 │   ├── merchant_database.py      # Categorization rules
+│   ├── custom_categories.py      # Session-only custom-category validation
 │   ├── llm_problem_parser.py     # LLM parser for Problemas cotidianos
 │   └── financial_calculator_v2.py # Deterministic calculator for solver v2
 ├── tests/                        # Test suite
-│   └── test_problem_solver_v2.py # Tests for the new solver
+│   ├── test_problem_solver_v2.py # Tests for the new solver
+│   ├── test_custom_categories.py # Custom-category validation and assignment tests
+│   └── test_custom_category_analysis.py # Reporting and meta-analysis tests
 └── bank_statements/              # Sample data
 ```
 

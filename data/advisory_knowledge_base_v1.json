@@ -108,6 +108,19 @@
           "viajes no esenciales",
           "apps no esenciales"
         ]
+      },
+      "user_custom": {
+        "definition": "Agrupador temporal creado por el usuario para seguimiento personal; no describe por sí mismo la naturaleza financiera del gasto.",
+        "criteria": [
+          "category_type igual a user_custom",
+          "identificador custom_aux_1, custom_aux_2 o custom_aux_3"
+        ],
+        "guardrails": [
+          "incluir el importe en el gasto total y flujo de caja",
+          "mostrarlo separado de fixed, variable y discretionary",
+          "no inferir que es innecesario, reducible o discrecional por su nombre",
+          "no convertirlo en una regla aprendida de comercio"
+        ]
       }
     },
     "classification_logic": [
@@ -490,6 +503,8 @@
       "category_analysis": [
         {
           "category": "string",
+          "category_label": "string",
+          "category_type": "system | user_custom",
           "budget": "number",
           "spent": "number",
           "variance": "number",

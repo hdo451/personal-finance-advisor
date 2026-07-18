@@ -46,6 +46,9 @@ class ContentAnalyzerAgent(BaseAgent):
             'entertainment': 'Streaming services, movies, games, events, recreation',
             'healthcare': 'Medical, dental, pharmacy, health-related expenses',
             'income': 'Salary deposits, interest, refunds, incoming transfers',
+            'other_income': 'Alternative earnings explicitly identified as freelance, professional services, rental, or other income',
+            'international_transfer_in': 'International transfer or SWIFT payment received from abroad',
+            'international_transfer_out': 'International transfer or SWIFT payment sent abroad',
             'fees': 'Bank fees, penalties, service charges, maintenance fees',
             'other': 'Transactions that don\'t clearly fit other categories'
         }
