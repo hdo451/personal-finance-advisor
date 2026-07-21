@@ -209,7 +209,7 @@ def _render_custom_category_manager(result: dict):
     """Render session-only custom category naming controls."""
     labels = _analysis_category_labels()
     with st.expander(
-        "✏️ Renombrar Auxiliar 1, Auxiliar 2 y Auxiliar 3",
+        "✏️ Renombrar Categoría 1, Categoría 2 y Categoría 3",
         expanded=True,
     ):
         st.caption(
@@ -217,19 +217,39 @@ def _render_custom_category_manager(result: dict):
             "'Hermana enferma'. Los nombres y asignaciones se borran al finalizar "
             "la sesión y nunca generan reglas de aprendizaje."
         )
+        st.markdown(
+            """
+            <style>
+                [data-testid="stForm"] [data-testid="stFormSubmitButton"] button {
+                    background-color: #FACC15 !important;
+                    border-color: #EAB308 !important;
+                    color: #1F2937 !important;
+                    font-weight: 700 !important;
+                }
+                [data-testid="stForm"] [data-testid="stFormSubmitButton"] button:hover {
+                    background-color: #EAB308 !important;
+                    border-color: #CA8A04 !important;
+                    color: #111827 !important;
+                }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
         with st.form("custom_category_names_form"):
             cols = st.columns(3)
             proposed = {}
             for index, category_id in enumerate(CUSTOM_CATEGORY_IDS):
                 with cols[index]:
                     proposed[category_id] = st.text_input(
-                        f"Nombre de Auxiliar {index + 1}",
+                        f"Nueva categoría {index + 1}",
                         value=labels[category_id],
                         max_chars=50,
                         key=f"custom_category_name_{category_id}",
                     )
             submitted = st.form_submit_button(
-                "💾 Guardar nuevos nombres", use_container_width=True
+                "💾 Guardar nuevos nombres",
+                type="primary",
+                use_container_width=True,
             )
 
         if submitted:
