@@ -208,6 +208,7 @@ def _save_custom_category_labels(result: dict, proposed_labels: dict):
 def _render_custom_category_manager(result: dict):
     """Render session-only custom category naming controls."""
     labels = _analysis_category_labels()
+    default_labels = default_custom_category_labels()
     with st.expander(
         "✏️ Renombrar Categoría 1, Categoría 2 y Categoría 3",
         expanded=True,
@@ -242,7 +243,12 @@ def _render_custom_category_manager(result: dict):
                 with cols[index]:
                     proposed[category_id] = st.text_input(
                         f"Nueva categoría {index + 1}",
-                        value=labels[category_id],
+                        value=(
+                            ""
+                            if labels[category_id] == default_labels[category_id]
+                            else labels[category_id]
+                        ),
+                        placeholder="(nuevo nombre acá)",
                         max_chars=50,
                         key=f"custom_category_name_{category_id}",
                     )
