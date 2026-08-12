@@ -25,6 +25,11 @@ from agents.document_processor import DocumentProcessorAgent
 from agents.content_analyzer import ContentAnalyzerAgent
 from agents.analysis_generator import AnalysisGeneratorAgent
 from utils.llm_interface import LLMInterface, resolve_openai_api_key
+from utils.internal_transfers import (
+    INTERNAL_TRANSFER_CATEGORY,
+    capture_pre_transfer_state,
+    set_automatic_transfer_detection,
+)
 
 class BankStatementAnalyzer:
     """
@@ -400,7 +405,7 @@ class BankStatementAnalyzer:
         return sorted(merged, key=sort_key)
 
     def detect_internal_transfers(self, transactions: List[Dict]) -> List[Dict]:
-        """Flag likely card-payment transfers to avoid double-counting household spending."""
+        """Detect likely internal transfers without overwriting user corrections."""
         card_purchases_by_person_month = defaultdict(float)
 
         for txn in transactions:
@@ -408,13 +413,23 @@ class BankStatementAnalyzer:
                 key = (txn.get('person') or 'default', txn.get('month') or 'unknown')
                 card_purchases_by_person_month[key] += float(txn.get('amount') or 0.0)
 
+        detections = [False] * len(transactions)
+        reasons: List[List[str]] = [[] for _ in transactions]
+
         for txn in transactions:
-            txn.setdefault('possible_internal_transfer', False)
-            txn.setdefault('internal_transfer_reason', '')
+            capture_pre_transfer_state(txn)
+
+        for index, txn in enumerate(transactions):
 
             desc = str(txn.get('description') or '').lower()
             month = txn.get('month') or 'unknown'
             person = txn.get('person') or 'default'
+
+            if txn.get('category') == INTERNAL_TRANSFER_CATEGORY:
+                detections[index] = True
+                reasons[index].append(
+                    'Classified as a transfer between the user\'s own accounts'
+                )
 
             if txn.get('movement_type') == 'possible_card_payment' and txn.get('is_debit'):
                 paid_amount = float(txn.get('amount') or 0.0)
@@ -423,25 +438,115 @@ class BankStatementAnalyzer:
                 if monthly_card_spend > 0:
                     ratio = paid_amount / monthly_card_spend if monthly_card_spend else 0.0
                     if 0.60 <= ratio <= 1.40:
-                        txn['possible_internal_transfer'] = True
-                        txn['internal_transfer_reason'] = (
-                            f"Possible card payment matched to card purchases for {month} "
+                        detections[index] = True
+                        reasons[index].append(
+                            f"Possible card payment matched to purchases for {month} "
                             f"(payment={paid_amount:.2f}, purchases={monthly_card_spend:.2f})"
                         )
-                        txn['effective_is_spending'] = False
 
             if txn.get('document_type') == 'credit_card' and txn.get('movement_type') == 'card_payment' and not txn.get('is_debit'):
-                txn['possible_internal_transfer'] = True
-                txn['internal_transfer_reason'] = 'Credit card payment credit, excluded from income totals'
-                txn['effective_is_income'] = False
+                detections[index] = True
+                reasons[index].append(
+                    'Credit-card payment credit, excluded from income'
+                )
 
-            if any(k in desc for k in ['internal transfer', 'traspaso propio', 'between accounts']):
-                txn['possible_internal_transfer'] = True
-                txn['internal_transfer_reason'] = 'Explicit internal transfer keyword detected'
-                txn['effective_is_spending'] = False if txn.get('is_debit') else txn.get('effective_is_spending', False)
-                txn['effective_is_income'] = False if not txn.get('is_debit') else txn.get('effective_is_income', False)
+            explicit_internal_markers = [
+                'internal transfer',
+                'between accounts',
+                'between my accounts',
+                'own account',
+                'online transfer to',
+                'online transfer from',
+                'online banking transfer to',
+                'online banking transfer from',
+                'online scheduled transfer to',
+                'online scheduled transfer from',
+                'transfer to checking',
+                'transfer from checking',
+                'transfer to savings',
+                'transfer from savings',
+                'traspaso propio',
+                'traspaso entre cuentas',
+                'transferencia entre cuentas',
+                'transferencia entre mis cuentas',
+                'transferencia a cuenta propia',
+                'transferencia desde cuenta propia',
+            ]
+            if any(marker in desc for marker in explicit_internal_markers):
+                detections[index] = True
+                reasons[index].append(
+                    'The description explicitly indicates an internal transfer'
+                )
+
+        self._detect_matching_transfer_pairs(transactions, detections, reasons)
+
+        for index, txn in enumerate(transactions):
+            set_automatic_transfer_detection(
+                txn,
+                detections[index],
+                '; '.join(dict.fromkeys(reasons[index])),
+            )
 
         return transactions
+
+    def _detect_matching_transfer_pairs(
+        self,
+        transactions: List[Dict],
+        detections: List[bool],
+        reasons: List[List[str]],
+    ) -> None:
+        """Match opposite same-amount movements across uploaded accounts."""
+        generic_markers = ('transfer', 'transferencia', 'traspaso', 'xfer')
+        international_markers = ('international', 'internacional', 'swift', 'wire')
+        candidates = []
+
+        for left_index, left in enumerate(transactions):
+            for right_index in range(left_index + 1, len(transactions)):
+                right = transactions[right_index]
+                if bool(left.get('is_debit')) == bool(right.get('is_debit')):
+                    continue
+                if left.get('source_document_id') == right.get('source_document_id'):
+                    continue
+                if abs(float(left.get('amount') or 0.0) - float(right.get('amount') or 0.0)) > 0.01:
+                    continue
+
+                descriptions = (
+                    str(left.get('description') or '').lower(),
+                    str(right.get('description') or '').lower(),
+                )
+                combined = ' '.join(descriptions)
+                if not any(marker in combined for marker in generic_markers):
+                    continue
+                if any(marker in combined for marker in international_markers):
+                    continue
+
+                try:
+                    left_date = datetime.strptime(str(left.get('date') or ''), '%Y-%m-%d')
+                    right_date = datetime.strptime(str(right.get('date') or ''), '%Y-%m-%d')
+                except ValueError:
+                    continue
+
+                date_gap = abs((left_date - right_date).days)
+                if date_gap > 3:
+                    continue
+                marker_count = sum(
+                    any(marker in description for marker in generic_markers)
+                    for description in descriptions
+                )
+                candidates.append((-marker_count, date_gap, left_index, right_index))
+
+        matched = set()
+        for _, date_gap, left_index, right_index in sorted(candidates):
+            if left_index in matched or right_index in matched:
+                continue
+            matched.update((left_index, right_index))
+            reason = (
+                'Opposite account movements with the same amount '
+                f'within {date_gap} day(s)'
+            )
+            for index in (left_index, right_index):
+                detections[index] = True
+                reasons[index].append(reason)
 
     def aggregate_by_month(self, transactions: List[Dict]) -> List[Dict]:
         monthly = {}

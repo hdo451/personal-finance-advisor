@@ -40,6 +40,12 @@ from utils.custom_categories import (
     resolve_category_label,
     validate_custom_category_labels,
 )
+from utils.internal_transfers import (
+    INTERNAL_TRANSFER_CATEGORY,
+    TRANSFER_OVERRIDE_NORMAL,
+    TRANSFER_OVERRIDE_TRANSFER,
+    apply_transfer_override,
+)
 
 KNOWLEDGE_BASE_PATH = Path(__file__).resolve().parent / "data" / "advisory_knowledge_base_v1.json"
 
@@ -55,6 +61,7 @@ CATEGORY_CODES = [
     'other_income',
     'international_transfer_in',
     'international_transfer_out',
+    INTERNAL_TRANSFER_CATEGORY,
     'fees',
     'other',
     'uncategorized',
@@ -64,6 +71,7 @@ CATEGORY_LABELS = {
     'other_income': 'Other Income',
     'international_transfer_in': 'International Transfer Received',
     'international_transfer_out': 'International Transfer Sent',
+    INTERNAL_TRANSFER_CATEGORY: 'Transfers Between My Accounts',
 }
 
 def _category_code_to_label(code: str) -> str:
@@ -124,8 +132,11 @@ def _transactions_to_editor_df(transactions: list) -> pd.DataFrame:
             'Category': _category_code_to_label(txn['category']),
             'Amount': txn['amount'],
             'Type': 'OUT' if txn['is_debit'] else 'IN',
-            'Counts as spending': bool(txn.get('effective_is_spending', txn.get('is_debit', False))),
-            'Internal transfer?': bool(txn.get('possible_internal_transfer', False)),
+            'Counts as Spending': bool(txn.get('effective_is_spending', txn.get('is_debit', False))),
+            'Transfer Explanation': str(
+                txn.get('internal_transfer_detection_reason')
+                or 'No automatic internal transfer was detected'
+            ),
             'Confidence': f"{txn['confidence']:.0%}",
             'Source': txn['source'].title()
         })
@@ -2352,9 +2363,13 @@ def display_results(result: dict):
         else:
             st.info("🤖 Activa 'Generar hallazgos con IA' para recomendaciones personalizadas")
 
-    with st.expander("📋 Ver todas las transacciones", expanded=False):
+    with st.expander("📋 View All Transactions", expanded=False):
         if all_transactions:
-            st.caption("Puedes editar las categorías de cualquier fila. Luego haz clic en 'Actualizar informe' para recalcular métricas, gráficos y hallazgos de IA.")
+            st.caption(
+                "Edit transaction categories here. 'Transfers Between My Accounts' is "
+                "the single transfer control: selecting it excludes a movement from both "
+                "income and spending, while selecting any other category includes it normally."
+            )
 
             if filtered_transactions:
                 df_transactions = _transactions_to_editor_df(filtered_transactions)
@@ -2376,8 +2391,10 @@ def display_results(result: dict):
                         'Doc Type': st.column_config.TextColumn('Doc Type', disabled=True),
                         'Description': st.column_config.TextColumn('Description', disabled=True),
                         'Type': st.column_config.TextColumn('Type', disabled=True),
-                        'Counts as spending': st.column_config.CheckboxColumn('Counts as spending', disabled=True),
-                        'Internal transfer?': st.column_config.CheckboxColumn('Internal transfer?', disabled=True),
+                        'Counts as Spending': st.column_config.CheckboxColumn('Counts as Spending', disabled=True),
+                        'Transfer Explanation': st.column_config.TextColumn(
+                            'Transfer Explanation', disabled=True
+                        ),
                         'Confidence': st.column_config.TextColumn('Confidence', disabled=True),
                         'Source': st.column_config.TextColumn('Source', disabled=True),
                         'Category': st.column_config.SelectboxColumn('Category', options=category_labels, required=True),
@@ -2387,7 +2404,7 @@ def display_results(result: dict):
                 bulk_col1, bulk_col2 = st.columns([2, 1])
                 with bulk_col1:
                     bulk_category = st.selectbox(
-                        "Categoría para filas seleccionadas",
+                        "Category for selected rows",
                         category_labels,
                         key="bulk_category_choice",
                     )
@@ -2395,26 +2412,26 @@ def display_results(result: dict):
                     st.write("")
                     st.write("")
                     if st.button(
-                        "Aplicar a seleccionadas",
+                        "Apply to selected rows",
                         type="secondary",
                         use_container_width=True,
                     ):
                         selected_mask = edited_df['Select'].fillna(False).astype(bool)
                         if not selected_mask.any():
-                            st.warning("Selecciona al menos una transacción.")
+                            st.warning("Select at least one transaction.")
                         else:
                             bulk_edited_df = edited_df.copy()
                             bulk_edited_df.loc[selected_mask, 'Category'] = bulk_category
                             _apply_manual_category_updates(result, bulk_edited_df)
 
                 if st.button(
-                    "🔄 Actualizar informe con categorías manuales",
+                    "🔄 Update Report with Manual Corrections",
                     type="secondary",
                     use_container_width=True,
                 ):
                     _apply_manual_category_updates(result, edited_df)
             else:
-                st.info("No hay transacciones que coincidan con los filtros actuales.")
+                st.info("No transactions match the current filters.")
 
     st.divider()
     st.subheader("🧠 Meta análisis")
@@ -2447,10 +2464,65 @@ def display_results(result: dict):
         st.warning(f"El último intento de meta análisis falló: {st.session_state.meta_analysis_error}")
 
 
+def _apply_transaction_review_row(transaction: dict, row: pd.Series) -> dict:
+    """Apply one editor row to a transaction without performing UI side effects."""
+    original_category = str(transaction.get('category') or 'other')
+    new_category = _category_label_to_code(row['Category'])
+    transfer_changed = False
+    rejected_category = False
+
+    if (
+        original_category == INTERNAL_TRANSFER_CATEGORY
+        and new_category != INTERNAL_TRANSFER_CATEGORY
+    ):
+        transfer_changed = apply_transfer_override(
+            transaction, TRANSFER_OVERRIDE_NORMAL
+        )
+
+    if new_category != str(transaction.get('category') or 'other'):
+        try:
+            assigned = assign_effective_category(transaction, new_category)
+            if assigned and new_category != INTERNAL_TRANSFER_CATEGORY:
+                transaction['pre_transfer_category'] = new_category
+                transaction['pre_transfer_category_source'] = str(
+                    transaction.get('category_source') or 'user_standard'
+                )
+        except ValueError:
+            rejected_category = True
+
+    if (
+        new_category == INTERNAL_TRANSFER_CATEGORY
+        and original_category != INTERNAL_TRANSFER_CATEGORY
+        and not rejected_category
+    ):
+        transfer_changed = (
+            apply_transfer_override(transaction, TRANSFER_OVERRIDE_TRANSFER)
+            or transfer_changed
+        )
+
+    final_category = str(transaction.get('category') or 'other')
+    category_changed = final_category != original_category
+    return {
+        'row_changed': transfer_changed or category_changed,
+        'transfer_changed': transfer_changed,
+        'category_changed': category_changed,
+        'rejected_custom_category': rejected_category,
+        'rule_category': (
+            final_category
+            if category_changed
+            and final_category == new_category
+            and not is_custom_category(final_category)
+            else None
+        ),
+    }
+
+
 def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
-    """Apply edits, learn only standard categories, and recompute the report."""
+    """Apply category and transfer edits, then recompute the report."""
     updated_transactions = copy.deepcopy(result['transactions'])
     changed_rows = 0
+    transfer_changes = 0
+    category_changes = 0
     rules_saved = 0
     rejected_custom_rows = 0
 
@@ -2458,30 +2530,33 @@ def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
         txn_index = int(row['_txn_index'])
         if txn_index < 0 or txn_index >= len(updated_transactions):
             continue
-        new_category = _category_label_to_code(row['Category'])
         transaction = updated_transactions[txn_index]
-        try:
-            changed = assign_effective_category(transaction, new_category)
-        except ValueError:
-            rejected_custom_rows += 1
-            continue
+        outcome = _apply_transaction_review_row(transaction, row)
 
-        if changed:
+        if outcome['rejected_custom_category']:
+            rejected_custom_rows += 1
+        if outcome['category_changed']:
+            category_changes += 1
+        if outcome['transfer_changed']:
+            transfer_changes += 1
+        if outcome['row_changed']:
             changed_rows += 1
-            if not is_custom_category(new_category):
-                saved_ok = st.session_state.analyzer.agent1.merchant_db.save_user_category_rule(
-                    transaction['description'], new_category
-                )
-                if saved_ok:
-                    rules_saved += 1
+
+        rule_category = outcome['rule_category']
+        if rule_category:
+            saved_ok = st.session_state.analyzer.agent1.merchant_db.save_user_category_rule(
+                transaction['description'], rule_category
+            )
+            if saved_ok:
+                rules_saved += 1
 
     if changed_rows == 0:
         if rejected_custom_rows:
             st.warning(
-                "Las categorías personalizadas solo pueden asignarse a transacciones que cuentan como gasto."
+                "Custom categories can only be assigned to transactions that count as spending."
             )
         else:
-            st.info("No hay cambios de categoría para aplicar.")
+            st.info("There are no corrections to apply.")
         return
 
     updated_result, llm_added_calls, llm_added_cost = _refresh_analysis_result(
@@ -2494,19 +2569,20 @@ def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
     _clear_meta_analysis_state()
 
     message = (
-        f"Informe actualizado con {changed_rows} cambio(s). "
-        f"Se guardaron {rules_saved} regla(s) financieras para futuros estados de cuenta."
+        f"Report updated with {changed_rows} corrected row(s): "
+        f"{category_changes} category change(s) and {transfer_changes} transfer "
+        f"treatment change(s). Saved {rules_saved} financial rule(s) for future statements."
     )
     if rejected_custom_rows:
         message += (
-            f" Se omitieron {rejected_custom_rows} fila(s) porque las categorías "
-            "personalizadas solo admiten gastos."
+            f" Skipped {rejected_custom_rows} row(s) because custom categories "
+            "only accept spending transactions."
         )
     st.session_state.category_flash_message = message
     if llm_added_calls > 0:
         st.session_state.category_flash_message += (
-            f" La actualización usó {llm_added_calls} llamada(s) LLM adicional(es), "
-            f"con costo estimado de +${llm_added_cost:.4f}."
+            f" The update used {llm_added_calls} additional LLM call(s), "
+            f"with an estimated cost of +${llm_added_cost:.4f}."
         )
 
     st.rerun()
