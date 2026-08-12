@@ -98,6 +98,7 @@ class MerchantDatabase:
             'other_income': [],
             'international_transfer_in': [],
             'international_transfer_out': [],
+            'internal_transfer': [],
             
             'atm_cash': [
                 'atm', 'withdrawal', 'cash advance', 'cash back', 'cashout'

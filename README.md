@@ -128,6 +128,10 @@ The software includes a second advisory layer designed to run only after human r
      in bulk.
    - Custom categories replace the visible financial category for the current
      report, but never create merchant-learning rules.
+   - The **Transfers Between My Accounts** category is the single transfer
+     control. It removes redundant internal movements from both income and
+     spending totals while keeping them visible in the transaction table;
+     selecting another category restores normal treatment.
 3. Click **Run Meta Analysis** to trigger one additional LLM call.
 4. Review a structured advisory report with:
    - Summary metrics

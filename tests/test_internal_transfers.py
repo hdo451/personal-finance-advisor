@@ -1,0 +1,222 @@
+import copy
+
+from agents.analysis_generator import AnalysisGeneratorAgent
+from main_coordinator import BankStatementAnalyzer
+from streamlit_app import (
+    _category_label_to_code,
+    _apply_transaction_review_row,
+    _transactions_to_editor_df,
+)
+from utils.internal_transfers import (
+    INTERNAL_TRANSFER_CATEGORY,
+    TRANSFER_OVERRIDE_AUTO,
+    TRANSFER_OVERRIDE_NORMAL,
+    TRANSFER_OVERRIDE_TRANSFER,
+    apply_transfer_override,
+)
+
+
+def _transaction(**updates):
+    transaction = {
+        "date": "2026-07-10",
+        "description": "Local purchase",
+        "amount": 100.0,
+        "is_debit": True,
+        "effective_is_spending": True,
+        "effective_is_income": False,
+        "category": "other",
+        "document_type": "bank_account",
+        "movement_type": "bank_movement",
+        "source_document_id": "checking",
+        "confidence": 0.95,
+        "source": "deterministic",
+    }
+    transaction.update(updates)
+    return transaction
+
+
+def _detect(transactions):
+    analyzer = BankStatementAnalyzer.__new__(BankStatementAnalyzer)
+    return analyzer.detect_internal_transfers(transactions)
+
+
+def test_explicit_spanish_internal_transfer_is_detected_and_excluded():
+    transactions = [
+        _transaction(description="Transferencia entre mis cuentas")
+    ]
+
+    _detect(transactions)
+
+    transaction = transactions[0]
+    assert transaction["detected_internal_transfer"] is True
+    assert transaction["internal_transfer_override"] == TRANSFER_OVERRIDE_AUTO
+    assert transaction["possible_internal_transfer"] is True
+    assert transaction["effective_is_spending"] is False
+    assert transaction["internal_transfer_detection_reason"]
+    assert transaction["category"] == INTERNAL_TRANSFER_CATEGORY
+
+
+def test_online_banking_transfer_description_is_detected():
+    transaction = _transaction(
+        description="Online Banking transfer from SAV 0445 Confirmation 183746"
+    )
+
+    _detect([transaction])
+
+    assert transaction["detected_internal_transfer"] is True
+    assert transaction["category"] == INTERNAL_TRANSFER_CATEGORY
+    assert transaction["effective_is_spending"] is False
+
+
+def test_manual_normal_override_corrects_false_positive_and_auto_restores_it():
+    transaction = _transaction(description="Internal transfer")
+    _detect([transaction])
+
+    assert apply_transfer_override(transaction, TRANSFER_OVERRIDE_NORMAL) is True
+    assert transaction["detected_internal_transfer"] is True
+    assert transaction["possible_internal_transfer"] is False
+    assert transaction["effective_is_spending"] is True
+    assert transaction["category"] == "other"
+
+    _detect([transaction])
+    assert transaction["internal_transfer_override"] == TRANSFER_OVERRIDE_NORMAL
+    assert transaction["detected_internal_transfer"] is True
+    assert transaction["possible_internal_transfer"] is False
+    assert transaction["effective_is_spending"] is True
+    assert transaction["category"] == "other"
+
+    assert apply_transfer_override(transaction, TRANSFER_OVERRIDE_AUTO) is True
+    assert transaction["possible_internal_transfer"] is True
+    assert transaction["effective_is_spending"] is False
+    assert transaction["category"] == INTERNAL_TRANSFER_CATEGORY
+
+
+def test_manual_transfer_override_excludes_ordinary_debit_and_credit():
+    debit = _transaction()
+    credit = _transaction(
+        is_debit=False,
+        effective_is_spending=False,
+        effective_is_income=True,
+        description="Incoming movement",
+    )
+
+    apply_transfer_override(debit, TRANSFER_OVERRIDE_TRANSFER)
+    apply_transfer_override(credit, TRANSFER_OVERRIDE_TRANSFER)
+
+    assert debit["effective_is_spending"] is False
+    assert debit["effective_is_income"] is False
+    assert credit["effective_is_spending"] is False
+    assert credit["effective_is_income"] is False
+    assert debit["category"] == INTERNAL_TRANSFER_CATEGORY
+    assert credit["category"] == INTERNAL_TRANSFER_CATEGORY
+
+    summary = AnalysisGeneratorAgent().process([debit, credit])["financial_summary"]
+    assert summary["total_spent"] == 0
+    assert summary["total_income"] == 0
+
+
+def test_same_amount_opposite_movements_across_accounts_are_paired():
+    debit = _transaction(
+        description="Transfer to savings",
+        source_document_id="checking",
+    )
+    credit = _transaction(
+        date="2026-07-11",
+        description="Deposit",
+        is_debit=False,
+        effective_is_spending=False,
+        effective_is_income=True,
+        source_document_id="savings",
+    )
+
+    transactions = [debit, credit]
+    _detect(transactions)
+
+    assert all(txn["detected_internal_transfer"] for txn in transactions)
+    assert all(not txn["effective_is_spending"] for txn in transactions)
+    assert all(not txn["effective_is_income"] for txn in transactions)
+    assert all(txn["category"] == INTERNAL_TRANSFER_CATEGORY for txn in transactions)
+
+
+def test_international_transfer_pair_is_not_treated_as_internal():
+    debit = _transaction(
+        description="International SWIFT transfer",
+        source_document_id="checking",
+    )
+    credit = _transaction(
+        description="International SWIFT transfer received",
+        is_debit=False,
+        effective_is_spending=False,
+        effective_is_income=True,
+        source_document_id="foreign_account",
+    )
+
+    transactions = copy.deepcopy([debit, credit])
+    _detect(transactions)
+
+    assert all(not txn["detected_internal_transfer"] for txn in transactions)
+    assert all(txn["category"] == "other" for txn in transactions)
+
+
+def test_editor_uses_category_as_the_only_visible_transfer_control():
+    transaction = _transaction(description="Internal transfer")
+    _detect([transaction])
+
+    automatic_row = _transactions_to_editor_df([transaction]).iloc[0]
+    assert "¿Transferencia automática?" not in automatic_row.index
+    assert "Transfer Treatment" not in automatic_row.index
+    assert automatic_row["Transfer Explanation"]
+    assert automatic_row["Category"] == "Transfers Between My Accounts"
+    assert _category_label_to_code("Transfers Between My Accounts") == (
+        INTERNAL_TRANSFER_CATEGORY
+    )
+
+    apply_transfer_override(transaction, TRANSFER_OVERRIDE_NORMAL)
+    corrected_row = _transactions_to_editor_df([transaction]).iloc[0]
+    assert corrected_row["Category"] == "Other"
+    assert bool(corrected_row["Counts as Spending"]) is True
+
+
+def test_internal_transfer_category_is_detected_even_without_keywords():
+    transaction = _transaction(
+        description="Movement 48392",
+        category=INTERNAL_TRANSFER_CATEGORY,
+    )
+
+    _detect([transaction])
+
+    assert transaction["detected_internal_transfer"] is True
+    assert transaction["category"] == INTERNAL_TRANSFER_CATEGORY
+    assert transaction["effective_is_spending"] is False
+
+
+def test_category_editor_marks_and_unmarks_internal_transfer():
+    transaction = _transaction()
+    _detect([transaction])
+
+    marked = _apply_transaction_review_row(
+        transaction,
+        {
+            "Category": "Transfers Between My Accounts",
+        },
+    )
+
+    assert marked["row_changed"] is True
+    assert marked["rule_category"] == INTERNAL_TRANSFER_CATEGORY
+    assert transaction["category"] == INTERNAL_TRANSFER_CATEGORY
+    assert transaction["internal_transfer_override"] == TRANSFER_OVERRIDE_TRANSFER
+    assert transaction["effective_is_spending"] is False
+    assert transaction["effective_is_income"] is False
+
+    unmarked = _apply_transaction_review_row(
+        transaction,
+        {
+            "Category": "Groceries",
+        },
+    )
+
+    assert unmarked["row_changed"] is True
+    assert unmarked["rule_category"] == "groceries"
+    assert transaction["category"] == "groceries"
+    assert transaction["internal_transfer_override"] == TRANSFER_OVERRIDE_NORMAL
+    assert transaction["effective_is_spending"] is True

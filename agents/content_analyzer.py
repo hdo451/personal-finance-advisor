@@ -49,6 +49,7 @@ class ContentAnalyzerAgent(BaseAgent):
             'other_income': 'Alternative earnings explicitly identified as freelance, professional services, rental, or other income',
             'international_transfer_in': 'International transfer or SWIFT payment received from abroad',
             'international_transfer_out': 'International transfer or SWIFT payment sent abroad',
+            'internal_transfer': 'Transfer between accounts owned by the same user; not income or spending',
             'fees': 'Bank fees, penalties, service charges, maintenance fees',
             'other': 'Transactions that don\'t clearly fit other categories'
         }
