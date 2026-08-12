@@ -3,8 +3,11 @@ import copy
 from agents.analysis_generator import AnalysisGeneratorAgent
 from main_coordinator import BankStatementAnalyzer
 from streamlit_app import (
+    _category_code_to_label,
     _category_label_to_code,
     _apply_transaction_review_row,
+    _selectable_category_labels,
+    _transaction_category_label_to_code,
     _transactions_to_editor_df,
 )
 from utils.internal_transfers import (
@@ -165,16 +168,56 @@ def test_editor_uses_category_as_the_only_visible_transfer_control():
     automatic_row = _transactions_to_editor_df([transaction]).iloc[0]
     assert "¿Transferencia automática?" not in automatic_row.index
     assert "Transfer Treatment" not in automatic_row.index
-    assert automatic_row["Transfer Explanation"]
-    assert automatic_row["Category"] == "Transfers Between My Accounts"
+    assert "Category" not in automatic_row.index
+    assert automatic_row["Explicación de transferencia"]
+    assert automatic_row["Categoría"] == "Transferencias entre mis cuentas"
     assert _category_label_to_code("Transfers Between My Accounts") == (
         INTERNAL_TRANSFER_CATEGORY
     )
+    assert _transaction_category_label_to_code(
+        "Transferencias entre mis cuentas"
+    ) == INTERNAL_TRANSFER_CATEGORY
 
     apply_transfer_override(transaction, TRANSFER_OVERRIDE_NORMAL)
     corrected_row = _transactions_to_editor_df([transaction]).iloc[0]
-    assert corrected_row["Category"] == "Other"
-    assert bool(corrected_row["Counts as Spending"]) is True
+    assert corrected_row["Categoría"] == "Otros"
+    assert bool(corrected_row["Cuenta como gasto"]) is True
+
+
+def test_editor_headers_and_standard_categories_are_in_spanish():
+    row = _transactions_to_editor_df([_transaction(category="groceries")]).iloc[0]
+
+    assert list(row.index) == [
+        "_txn_index",
+        "Seleccionar",
+        "Fecha",
+        "Mes",
+        "Persona",
+        "Documento",
+        "Tipo de documento",
+        "Descripción",
+        "Categoría",
+        "Monto",
+        "Tipo",
+        "Cuenta como gasto",
+        "Explicación de transferencia",
+        "Confianza",
+        "Origen",
+    ]
+    assert row["Categoría"] == "Supermercado"
+    assert row["Tipo"] == "EGRESO"
+    assert "Comidas y restaurantes" in _selectable_category_labels()
+    assert "Transferencias entre mis cuentas" in _selectable_category_labels()
+
+
+def test_chart_and_filter_category_labels_are_in_spanish():
+    assert _category_code_to_label("food_dining") == "Comidas y restaurantes"
+    assert _category_code_to_label("groceries") == "Supermercado"
+    assert _category_code_to_label("bills_utilities") == "Cuentas y servicios"
+    assert _category_code_to_label(INTERNAL_TRANSFER_CATEGORY) == (
+        "Transferencias entre mis cuentas"
+    )
+    assert _category_label_to_code("Comidas y restaurantes") == "food_dining"
 
 
 def test_internal_transfer_category_is_detected_even_without_keywords():
@@ -197,7 +240,7 @@ def test_category_editor_marks_and_unmarks_internal_transfer():
     marked = _apply_transaction_review_row(
         transaction,
         {
-            "Category": "Transfers Between My Accounts",
+            "Categoría": "Transferencias entre mis cuentas",
         },
     )
 
@@ -211,7 +254,7 @@ def test_category_editor_marks_and_unmarks_internal_transfer():
     unmarked = _apply_transaction_review_row(
         transaction,
         {
-            "Category": "Groceries",
+            "Categoría": "Supermercado",
         },
     )
 

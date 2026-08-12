@@ -68,6 +68,24 @@ CATEGORY_CODES = [
 ]
 
 CATEGORY_LABELS = {
+    'food_dining': 'Comidas y restaurantes',
+    'groceries': 'Supermercado',
+    'transportation': 'Transporte',
+    'shopping': 'Compras',
+    'bills_utilities': 'Cuentas y servicios',
+    'entertainment': 'Entretenimiento',
+    'healthcare': 'Salud',
+    'income': 'Ingresos',
+    'other_income': 'Otros ingresos',
+    'international_transfer_in': 'Transferencia internacional recibida',
+    'international_transfer_out': 'Transferencia internacional enviada',
+    INTERNAL_TRANSFER_CATEGORY: 'Transferencias entre mis cuentas',
+    'fees': 'Comisiones',
+    'other': 'Otros',
+    'uncategorized': 'Sin categoría',
+}
+
+LEGACY_CATEGORY_LABELS_EN = {
     'other_income': 'Other Income',
     'international_transfer_in': 'International Transfer Received',
     'international_transfer_out': 'International Transfer Sent',
@@ -91,20 +109,51 @@ def _category_label_to_code(label: str) -> str:
     for code, display_label in CATEGORY_LABELS.items():
         if normalized_label == display_label.casefold():
             return code
+    for code, display_label in LEGACY_CATEGORY_LABELS_EN.items():
+        if normalized_label == display_label.casefold():
+            return code
     normalized = str(label).strip().lower().replace(' ', '_')
     if normalized in CATEGORY_CODES:
         return normalized
     return 'other'
 
 
+def _transaction_category_code_to_label(code: str) -> str:
+    """Return the Spanish category label used by the transaction editor."""
+    custom_labels = st.session_state.get(
+        'custom_category_labels', default_custom_category_labels()
+    )
+    if code in custom_labels:
+        return str(custom_labels[code])
+    return _category_code_to_label(code)
+
+
+def _transaction_category_label_to_code(label: str) -> str:
+    """Resolve a transaction-editor category label back to its stable code."""
+    normalized_label = str(label).strip().casefold()
+    custom_labels = st.session_state.get(
+        'custom_category_labels', default_custom_category_labels()
+    )
+    for code, display_label in custom_labels.items():
+        if normalized_label == str(display_label).strip().casefold():
+            return code
+    for code, display_label in CATEGORY_LABELS.items():
+        if normalized_label == display_label.casefold():
+            return code
+    return _category_label_to_code(label)
+
+
 def _selectable_category_labels() -> list[str]:
-    """Return standard and session-only custom labels for transaction editing."""
+    """Return Spanish standard and session-only custom editor labels."""
     standard = [
-        _category_code_to_label(code)
+        _transaction_category_code_to_label(code)
         for code in CATEGORY_CODES
         if code != 'uncategorized'
     ]
-    custom = [_category_code_to_label(code) for code in CUSTOM_CATEGORY_IDS]
+    custom = [
+        _transaction_category_code_to_label(code)
+        for code in CUSTOM_CATEGORY_IDS
+    ]
     return standard + custom
 
 
@@ -122,23 +171,23 @@ def _transactions_to_editor_df(transactions: list) -> pd.DataFrame:
     for idx, txn in enumerate(transactions):
         rows.append({
             '_txn_index': int(txn.get('_global_index', idx)),
-            'Select': False,
-            'Date': txn['date'],
-            'Month': txn.get('month', ''),
-            'Person': txn.get('person', ''),
-            'Document': txn.get('source_file_name', ''),
-            'Doc Type': txn.get('document_type', ''),
-            'Description': txn['description'],
-            'Category': _category_code_to_label(txn['category']),
-            'Amount': txn['amount'],
-            'Type': 'OUT' if txn['is_debit'] else 'IN',
-            'Counts as Spending': bool(txn.get('effective_is_spending', txn.get('is_debit', False))),
-            'Transfer Explanation': str(
+            'Seleccionar': False,
+            'Fecha': txn['date'],
+            'Mes': txn.get('month', ''),
+            'Persona': txn.get('person', ''),
+            'Documento': txn.get('source_file_name', ''),
+            'Tipo de documento': txn.get('document_type', ''),
+            'Descripción': txn['description'],
+            'Categoría': _transaction_category_code_to_label(txn['category']),
+            'Monto': txn['amount'],
+            'Tipo': 'EGRESO' if txn['is_debit'] else 'INGRESO',
+            'Cuenta como gasto': bool(txn.get('effective_is_spending', txn.get('is_debit', False))),
+            'Explicación de transferencia': str(
                 txn.get('internal_transfer_detection_reason')
-                or 'No automatic internal transfer was detected'
+                or 'No se detectó automáticamente una transferencia interna'
             ),
-            'Confidence': f"{txn['confidence']:.0%}",
-            'Source': txn['source'].title()
+            'Confianza': f"{txn['confidence']:.0%}",
+            'Origen': txn['source'].title()
         })
     return pd.DataFrame(rows)
 
@@ -1907,13 +1956,13 @@ def _render_meta_analysis_result(meta_state: dict):
                "Para cambios en tus estrategias de inversión o deudas, consulta siempre con un asesor financiero profesional.*")
 
 if hasattr(st, 'dialog'):
-    @st.dialog("Category Items")
+    @st.dialog("Movimientos de la categoría")
     def _show_category_items_modal(category_label: str, transactions: list):
-        st.subheader(f"{category_label} - Items")
+        st.subheader(f"{category_label} - Movimientos")
         items = _get_category_items_for_modal(transactions, category_label)
 
         if not items:
-            st.info("No spending items found for this category.")
+            st.info("No se encontraron gastos para esta categoría.")
             return
 
         for item in items:
@@ -1921,7 +1970,7 @@ if hasattr(st, 'dialog'):
             st.write(f"{item['Description']} | {amount_formatted}")
 else:
     def _show_category_items_modal(category_label: str, transactions: list):
-        st.warning("Your Streamlit version does not support modal dialogs. Please upgrade Streamlit to use this feature.")
+        st.warning("Tu versión de Streamlit no admite ventanas emergentes. Actualiza Streamlit para usar esta función.")
 
 def initialize_session_state():
     """Initialize Streamlit session state"""
@@ -2306,9 +2355,9 @@ def display_results(result: dict):
             if not spending_totals:
                 st.info("No hay gastos efectivos para graficar bajo los filtros actuales.")
             else:
-                spending_rows = pd.DataFrame([{'Category': category, 'Amount': float(amount)} for category, amount in spending_totals.items()]).sort_values('Amount', ascending=False).reset_index(drop=True)
-                category_names = spending_rows['Category'].tolist()
-                category_amounts = spending_rows['Amount'].tolist()
+                spending_rows = pd.DataFrame([{'Categoría': category, 'Monto': float(amount)} for category, amount in spending_totals.items()]).sort_values('Monto', ascending=False).reset_index(drop=True)
+                category_names = spending_rows['Categoría'].tolist()
+                category_amounts = spending_rows['Monto'].tolist()
                 pie_colors = px.colors.qualitative.Set3 + px.colors.qualitative.Pastel + px.colors.qualitative.Bold
                 fig_pie = go.Figure(data=[go.Pie(labels=category_names, values=category_amounts, sort=False, direction='clockwise', textposition='inside', textinfo='percent+label', marker=dict(colors=pie_colors[:len(category_names)], line=dict(color='white', width=2)))])
                 fig_pie.update_layout(title="Distribución del gasto", showlegend=True, margin=dict(t=40, l=10, r=10, b=10))
@@ -2339,10 +2388,10 @@ def display_results(result: dict):
                 rows = []
                 for cat, amount in totals.items():
                     pct = (amount / total_spent_filtered * 100) if total_spent_filtered > 0 else 0.0
-                    rows.append({'Category': _category_code_to_label(cat), 'Amount': amount, 'Percentage': pct, 'Count': counts.get(cat, 0)})
+                    rows.append({'Categoría': _category_code_to_label(cat), 'Monto': amount, 'Porcentaje': pct, 'Cantidad': counts.get(cat, 0)})
 
-                df_categories = pd.DataFrame(rows).sort_values('Amount', ascending=False).head(6)
-                fig_bar = px.bar(df_categories, x='Category', y='Amount', title="Principales categorías por monto", text='Amount', color='Percentage', color_continuous_scale='Viridis')
+                df_categories = pd.DataFrame(rows).sort_values('Monto', ascending=False).head(6)
+                fig_bar = px.bar(df_categories, x='Categoría', y='Monto', title="Principales categorías por monto", text='Monto', color='Porcentaje', color_continuous_scale='Viridis')
                 fig_bar.update_traces(texttemplate='$%{text:.0f}', textposition='outside')
                 fig_bar.update_layout(showlegend=False)
                 st.plotly_chart(fig_bar, use_container_width=True)
@@ -2363,12 +2412,13 @@ def display_results(result: dict):
         else:
             st.info("🤖 Activa 'Generar hallazgos con IA' para recomendaciones personalizadas")
 
-    with st.expander("📋 View All Transactions", expanded=False):
+    with st.expander("📋 Ver todas las transacciones", expanded=False):
         if all_transactions:
             st.caption(
-                "Edit transaction categories here. 'Transfers Between My Accounts' is "
-                "the single transfer control: selecting it excludes a movement from both "
-                "income and spending, while selecting any other category includes it normally."
+                "Edita aquí las categorías de las transacciones. "
+                "'Transferencias entre mis cuentas' es el único control para transferencias: "
+                "al seleccionarla, el movimiento se excluye tanto de los ingresos como de "
+                "los gastos; cualquier otra categoría restaura el tratamiento normal."
             )
 
             if filtered_transactions:
@@ -2382,29 +2432,29 @@ def display_results(result: dict):
                     key='transactions_editor',
                     column_config={
                         '_txn_index': None,
-                        'Select': st.column_config.CheckboxColumn('Select', default=False),
-                        'Amount': st.column_config.NumberColumn('Amount', format='$%.2f', disabled=True),
-                        'Date': st.column_config.TextColumn('Date', disabled=True),
-                        'Month': st.column_config.TextColumn('Month', disabled=True),
-                        'Person': st.column_config.TextColumn('Person', disabled=True),
-                        'Document': st.column_config.TextColumn('Document', disabled=True),
-                        'Doc Type': st.column_config.TextColumn('Doc Type', disabled=True),
-                        'Description': st.column_config.TextColumn('Description', disabled=True),
-                        'Type': st.column_config.TextColumn('Type', disabled=True),
-                        'Counts as Spending': st.column_config.CheckboxColumn('Counts as Spending', disabled=True),
-                        'Transfer Explanation': st.column_config.TextColumn(
-                            'Transfer Explanation', disabled=True
+                        'Seleccionar': st.column_config.CheckboxColumn('Seleccionar', default=False),
+                        'Monto': st.column_config.NumberColumn('Monto', format='$%.2f', disabled=True),
+                        'Fecha': st.column_config.TextColumn('Fecha', disabled=True),
+                        'Mes': st.column_config.TextColumn('Mes', disabled=True),
+                        'Persona': st.column_config.TextColumn('Persona', disabled=True),
+                        'Documento': st.column_config.TextColumn('Documento', disabled=True),
+                        'Tipo de documento': st.column_config.TextColumn('Tipo de documento', disabled=True),
+                        'Descripción': st.column_config.TextColumn('Descripción', disabled=True),
+                        'Tipo': st.column_config.TextColumn('Tipo', disabled=True),
+                        'Cuenta como gasto': st.column_config.CheckboxColumn('Cuenta como gasto', disabled=True),
+                        'Explicación de transferencia': st.column_config.TextColumn(
+                            'Explicación de transferencia', disabled=True
                         ),
-                        'Confidence': st.column_config.TextColumn('Confidence', disabled=True),
-                        'Source': st.column_config.TextColumn('Source', disabled=True),
-                        'Category': st.column_config.SelectboxColumn('Category', options=category_labels, required=True),
+                        'Confianza': st.column_config.TextColumn('Confianza', disabled=True),
+                        'Origen': st.column_config.TextColumn('Origen', disabled=True),
+                        'Categoría': st.column_config.SelectboxColumn('Categoría', options=category_labels, required=True),
                     },
                 )
 
                 bulk_col1, bulk_col2 = st.columns([2, 1])
                 with bulk_col1:
                     bulk_category = st.selectbox(
-                        "Category for selected rows",
+                        "Categoría para las filas seleccionadas",
                         category_labels,
                         key="bulk_category_choice",
                     )
@@ -2412,26 +2462,26 @@ def display_results(result: dict):
                     st.write("")
                     st.write("")
                     if st.button(
-                        "Apply to selected rows",
+                        "Aplicar a las filas seleccionadas",
                         type="secondary",
                         use_container_width=True,
                     ):
-                        selected_mask = edited_df['Select'].fillna(False).astype(bool)
+                        selected_mask = edited_df['Seleccionar'].fillna(False).astype(bool)
                         if not selected_mask.any():
-                            st.warning("Select at least one transaction.")
+                            st.warning("Selecciona al menos una transacción.")
                         else:
                             bulk_edited_df = edited_df.copy()
-                            bulk_edited_df.loc[selected_mask, 'Category'] = bulk_category
+                            bulk_edited_df.loc[selected_mask, 'Categoría'] = bulk_category
                             _apply_manual_category_updates(result, bulk_edited_df)
 
                 if st.button(
-                    "🔄 Update Report with Manual Corrections",
+                    "🔄 Actualizar informe con correcciones manuales",
                     type="secondary",
                     use_container_width=True,
                 ):
                     _apply_manual_category_updates(result, edited_df)
             else:
-                st.info("No transactions match the current filters.")
+                st.info("No hay transacciones que coincidan con los filtros actuales.")
 
     st.divider()
     st.subheader("🧠 Meta análisis")
@@ -2467,7 +2517,7 @@ def display_results(result: dict):
 def _apply_transaction_review_row(transaction: dict, row: pd.Series) -> dict:
     """Apply one editor row to a transaction without performing UI side effects."""
     original_category = str(transaction.get('category') or 'other')
-    new_category = _category_label_to_code(row['Category'])
+    new_category = _transaction_category_label_to_code(row['Categoría'])
     transfer_changed = False
     rejected_category = False
 
@@ -2553,10 +2603,10 @@ def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
     if changed_rows == 0:
         if rejected_custom_rows:
             st.warning(
-                "Custom categories can only be assigned to transactions that count as spending."
+                "Las categorías personalizadas solo pueden asignarse a transacciones que cuentan como gasto."
             )
         else:
-            st.info("There are no corrections to apply.")
+            st.info("No hay correcciones para aplicar.")
         return
 
     updated_result, llm_added_calls, llm_added_cost = _refresh_analysis_result(
@@ -2569,20 +2619,20 @@ def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
     _clear_meta_analysis_state()
 
     message = (
-        f"Report updated with {changed_rows} corrected row(s): "
-        f"{category_changes} category change(s) and {transfer_changes} transfer "
-        f"treatment change(s). Saved {rules_saved} financial rule(s) for future statements."
+        f"Informe actualizado con {changed_rows} fila(s) corregida(s): "
+        f"{category_changes} cambio(s) de categoría y {transfer_changes} cambio(s) "
+        f"de transferencia. Se guardaron {rules_saved} regla(s) financieras para futuros estados de cuenta."
     )
     if rejected_custom_rows:
         message += (
-            f" Skipped {rejected_custom_rows} row(s) because custom categories "
-            "only accept spending transactions."
+            f" Se omitieron {rejected_custom_rows} fila(s) porque las categorías "
+            "personalizadas solo aceptan transacciones que cuentan como gasto."
         )
     st.session_state.category_flash_message = message
     if llm_added_calls > 0:
         st.session_state.category_flash_message += (
-            f" The update used {llm_added_calls} additional LLM call(s), "
-            f"with an estimated cost of +${llm_added_cost:.4f}."
+            f" La actualización utilizó {llm_added_calls} llamada(s) LLM adicional(es), "
+            f"con un costo estimado de +${llm_added_cost:.4f}."
         )
 
     st.rerun()
