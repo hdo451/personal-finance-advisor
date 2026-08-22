@@ -9,7 +9,13 @@ from agents.content_analyzer import ContentAnalyzerAgent
 from agents.analysis_generator import AnalysisGeneratorAgent
 from utils.llm_interface import LLMInterface
 import os
+import pytest
 from dotenv import load_dotenv
+
+pytestmark = pytest.mark.skipif(
+    os.getenv('RUN_OPENAI_INTEGRATION_TESTS') != '1',
+    reason='Live OpenAI integration test; opt in with RUN_OPENAI_INTEGRATION_TESTS=1',
+)
 
 def test_complete_pipeline():
     """Test all 3 agents working together"""

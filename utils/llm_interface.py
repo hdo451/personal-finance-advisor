@@ -34,7 +34,13 @@ class LLMInterface:
         self.call_count = 0    # Track total calls
         self.total_cost = 0.0  # Track estimated cost
 
-    def make_call(self, prompt: str, system_prompt: str = None, expect_json: bool = False) -> Optional[str]:
+    def make_call(
+        self,
+        prompt: str,
+        system_prompt: str = None,
+        expect_json: bool = False,
+        response_schema: Optional[Dict] = None,
+    ) -> Optional[str]:
         """
         Single point for ALL LLM calls in your system
         Every agent must use this method
@@ -57,7 +63,17 @@ class LLMInterface:
                 "temperature": 0,
             }
             if expect_json:
-                request_payload["response_format"] = {"type": "json_object"}
+                if response_schema:
+                    request_payload["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "financial_analyzer_response",
+                            "strict": True,
+                            "schema": response_schema,
+                        },
+                    }
+                else:
+                    request_payload["response_format"] = {"type": "json_object"}
 
             response = self.client.chat.completions.create(**request_payload)
 

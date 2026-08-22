@@ -169,6 +169,10 @@ def _transactions_to_editor_df(transactions: list) -> pd.DataFrame:
     """Create editable DataFrame for manual category review."""
     rows = []
     for idx, txn in enumerate(transactions):
+        if not txn.get('direction_known', True):
+            movement_label = 'REVISAR'
+        else:
+            movement_label = 'EGRESO' if txn['is_debit'] else 'INGRESO'
         rows.append({
             '_txn_index': int(txn.get('_global_index', idx)),
             'Seleccionar': False,
@@ -180,7 +184,7 @@ def _transactions_to_editor_df(transactions: list) -> pd.DataFrame:
             'Descripción': txn['description'],
             'Categoría': _transaction_category_code_to_label(txn['category']),
             'Monto': txn['amount'],
-            'Tipo': 'EGRESO' if txn['is_debit'] else 'INGRESO',
+            'Tipo': movement_label,
             'Cuenta como gasto': bool(txn.get('effective_is_spending', txn.get('is_debit', False))),
             'Explicación de transferencia': str(
                 txn.get('internal_transfer_detection_reason')
@@ -415,16 +419,19 @@ def _build_statement_inputs_from_uploads(uploaded_files: list) -> list:
 
     for idx, uploaded_file in enumerate(uploaded_files, start=1):
         # Keep per-file metadata for internal traceability, but do not expose editing in the UI.
-            statement_inputs.append({
-                'uploaded_file': uploaded_file,
-                'metadata': {
-                    'file_name': uploaded_file.name,
+        statement_inputs.append({
+            'uploaded_file': uploaded_file,
+            'metadata': {
+                'file_name': uploaded_file.name,
                 'document_type': 'bank_account',
-                'person': f'persona_{idx}',
+                # Uploaded accounts belong to the current user unless a future
+                # UI explicitly says otherwise. Shared ownership metadata is
+                # required to match transfers across those accounts safely.
+                'person': 'default',
                 'account_label': f'cuenta_{idx}',
                 'institution': '',
-                }
-            })
+            }
+        })
 
     return statement_inputs
 
@@ -2440,7 +2447,9 @@ def display_results(result: dict):
                         'Documento': st.column_config.TextColumn('Documento', disabled=True),
                         'Tipo de documento': st.column_config.TextColumn('Tipo de documento', disabled=True),
                         'Descripción': st.column_config.TextColumn('Descripción', disabled=True),
-                        'Tipo': st.column_config.TextColumn('Tipo', disabled=True),
+                        'Tipo': st.column_config.SelectboxColumn(
+                            'Tipo', options=['EGRESO', 'INGRESO', 'REVISAR'], required=True
+                        ),
                         'Cuenta como gasto': st.column_config.CheckboxColumn('Cuenta como gasto', disabled=True),
                         'Explicación de transferencia': st.column_config.TextColumn(
                             'Explicación de transferencia', disabled=True
@@ -2520,6 +2529,27 @@ def _apply_transaction_review_row(transaction: dict, row: pd.Series) -> dict:
     new_category = _transaction_category_label_to_code(row['Categoría'])
     transfer_changed = False
     rejected_category = False
+    direction_changed = False
+
+    requested_type = str(row.get('Tipo', '') or '').strip().upper()
+    if requested_type in {'EGRESO', 'INGRESO'}:
+        requested_is_debit = requested_type == 'EGRESO'
+        if (
+            not transaction.get('direction_known', True)
+            or bool(transaction.get('is_debit')) != requested_is_debit
+        ):
+            transaction['is_debit'] = requested_is_debit
+            transaction['direction_known'] = True
+            transaction['direction_source'] = 'user_review'
+            transaction['direction_confidence'] = 1.0
+            transaction['excluded_from_totals'] = False
+            transaction.pop('exclusion_reason', None)
+            transaction['pre_transfer_is_spending'] = requested_is_debit
+            transaction['pre_transfer_is_income'] = not requested_is_debit
+            if str(transaction.get('category') or '') != INTERNAL_TRANSFER_CATEGORY:
+                transaction['effective_is_spending'] = requested_is_debit
+                transaction['effective_is_income'] = not requested_is_debit
+            direction_changed = True
 
     if (
         original_category == INTERNAL_TRANSFER_CATEGORY
@@ -2553,15 +2583,17 @@ def _apply_transaction_review_row(transaction: dict, row: pd.Series) -> dict:
     final_category = str(transaction.get('category') or 'other')
     category_changed = final_category != original_category
     return {
-        'row_changed': transfer_changed or category_changed,
+        'row_changed': transfer_changed or category_changed or direction_changed,
         'transfer_changed': transfer_changed,
         'category_changed': category_changed,
+        'direction_changed': direction_changed,
         'rejected_custom_category': rejected_category,
         'rule_category': (
             final_category
             if category_changed
             and final_category == new_category
             and not is_custom_category(final_category)
+            and final_category != INTERNAL_TRANSFER_CATEGORY
             else None
         ),
     }
@@ -2573,6 +2605,7 @@ def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
     changed_rows = 0
     transfer_changes = 0
     category_changes = 0
+    direction_changes = 0
     rules_saved = 0
     rejected_custom_rows = 0
 
@@ -2589,6 +2622,8 @@ def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
             category_changes += 1
         if outcome['transfer_changed']:
             transfer_changes += 1
+        if outcome['direction_changed']:
+            direction_changes += 1
         if outcome['row_changed']:
             changed_rows += 1
 
@@ -2620,7 +2655,8 @@ def _apply_manual_category_updates(result: dict, edited_df: pd.DataFrame):
 
     message = (
         f"Informe actualizado con {changed_rows} fila(s) corregida(s): "
-        f"{category_changes} cambio(s) de categoría y {transfer_changes} cambio(s) "
+        f"{category_changes} cambio(s) de categoría, {direction_changes} de tipo y "
+        f"{transfer_changes} cambio(s) "
         f"de transferencia. Se guardaron {rules_saved} regla(s) financieras para futuros estados de cuenta."
     )
     if rejected_custom_rows:
@@ -2647,9 +2683,23 @@ def show_debug_diagnostics(result: dict):
             for item in debug_data:
                 st.write(f"**{item.get('file_name', item.get('document_id', 'document'))}**")
                 parsing_stats = item.get('parsing_stats')
+                reconciliation = item.get('reconciliation')
                 lines = item.get('sample_transaction_lines', [])[:10]
+                excluded = item.get('sample_excluded_rows', [])[:10]
+                if item.get('statement_profile'):
+                    st.caption(f"Perfil detectado: {item['statement_profile']}")
                 if parsing_stats:
                     st.json(parsing_stats)
+                if reconciliation:
+                    st.write("**Conciliación determinística**")
+                    st.json(reconciliation)
+                if excluded:
+                    st.write("**Filas agregadas/saldos excluidos (muestra)**")
+                    for row in excluded:
+                        st.code(
+                            f"{row.get('row_type', 'excluded')}: "
+                            f"{_redact_diagnostic_line(row.get('text', ''))}"
+                        )
                 if lines:
                     for line in lines:
                         st.code(_redact_diagnostic_line(line))

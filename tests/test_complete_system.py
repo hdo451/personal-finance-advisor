@@ -6,7 +6,13 @@ Tests the full integrated system
 
 from main_coordinator import BankStatementAnalyzer
 import os
+import pytest
 from dotenv import load_dotenv
+
+pytestmark = pytest.mark.skipif(
+    os.getenv('RUN_OPENAI_INTEGRATION_TESTS') != '1',
+    reason='Live OpenAI integration test; opt in with RUN_OPENAI_INTEGRATION_TESTS=1',
+)
 
 def test_complete_system():
     """Test the integrated 3-agent system"""

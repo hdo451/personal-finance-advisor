@@ -5,6 +5,7 @@ Valida: parser LLM, cálculos determinísticos, y lógica de UI.
 
 import pytest
 import json
+import os
 from utils.llm_problem_parser import LLMProblemParser
 from utils.financial_calculator_v2 import (
     FinancialCalculator,
@@ -13,6 +14,10 @@ from utils.financial_calculator_v2 import (
 )
 
 
+@pytest.mark.skipif(
+    os.getenv('RUN_OPENAI_INTEGRATION_TESTS') != '1',
+    reason='Live OpenAI integration test; opt in with RUN_OPENAI_INTEGRATION_TESTS=1',
+)
 class TestLLMProblemParser:
     """Pruebas del parser LLM."""
     
@@ -196,6 +201,10 @@ class TestFinancialCalculator:
 class TestIntegration:
     """Pruebas de integración."""
     
+    @pytest.mark.skipif(
+        os.getenv('RUN_OPENAI_INTEGRATION_TESTS') != '1',
+        reason='Live OpenAI integration test; opt in with RUN_OPENAI_INTEGRATION_TESTS=1',
+    )
     def test_full_workflow(self):
         """Prueba el flujo completo: parsing -> validación -> cálculo."""
         parser = LLMProblemParser()

@@ -1,5 +1,6 @@
 import pdfplumber
 import re
+import unicodedata
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from .base_agent import BaseAgent
@@ -15,6 +16,11 @@ class DocumentProcessorAgent(BaseAgent):
         super().__init__("Document Processor", uses_llm=False)
         self.merchant_db = MerchantDatabase()
         self._statement_date_range_hint: Optional[Tuple[datetime, datetime]] = None
+        self._opening_balance_hint: Optional[float] = None
+        self._closing_balance_hint: Optional[float] = None
+        self._statement_profile = 'generic_bank_account'
+        self._statement_kind = 'bank_account'
+        self._last_excluded_rows: List[Dict] = []
         print(f"🏗️ {self.name} initialized - 0 LLM calls")
 
     def process(self, pdf_path: str) -> Dict:
@@ -29,6 +35,12 @@ class DocumentProcessorAgent(BaseAgent):
                 return {'success': False, 'error': 'No text in PDF', 'transactions': []}
 
             self._statement_date_range_hint = self._infer_statement_date_range(raw_text)
+            self._opening_balance_hint, self._closing_balance_hint = (
+                self._infer_statement_balance_hints(raw_text)
+            )
+            self._statement_profile, self._statement_kind = (
+                self._infer_statement_profile(raw_text, pdf_path)
+            )
             
             print(f"   ✅ Extracted {len(raw_text)} characters")
             
@@ -45,6 +57,7 @@ class DocumentProcessorAgent(BaseAgent):
             
             # NEW Step 3: Parse transaction lines into structured data
             parsed_transactions = self._parse_transaction_lines(transaction_lines)
+            reconciliation = self._reconcile_transaction_directions(parsed_transactions)
             
             categorized_transactions = self._apply_basic_categorization(parsed_transactions)
 
@@ -56,6 +69,14 @@ class DocumentProcessorAgent(BaseAgent):
                     item.get('text', '') if isinstance(item, dict) else str(item)
                     for item in transaction_lines
                 ],
+                'excluded_rows': list(self._last_excluded_rows),
+                'statement_profile': self._statement_profile,
+                'statement_kind': self._statement_kind,
+                'balance_hints': {
+                    'opening': self._opening_balance_hint,
+                    'closing': self._closing_balance_hint,
+                },
+                'reconciliation': reconciliation,
                 'parsing_stats': {
                     'lines_found': len(transaction_lines),
                     'successfully_parsed': len(parsed_transactions),
@@ -98,7 +119,9 @@ class DocumentProcessorAgent(BaseAgent):
                         full_text += f"--- END TABLE {table_num} ---\n"
                 
                 # Method 2: Regular text extraction as backup
-                page_text = page.extract_text()
+                # Preserve horizontal spacing so debit/credit columns remain
+                # distinguishable even when pdfplumber cannot extract a table.
+                page_text = page.extract_text(layout=True)
                 if page_text:
                     full_text += f"\n--- PAGE {page_num} TEXT ---\n"
                     full_text += page_text
@@ -126,6 +149,7 @@ class DocumentProcessorAgent(BaseAgent):
         counting the same transaction once from a table and again from text,
         while preserving legitimate repeated rows within the selected source.
         """
+        self._last_excluded_rows = []
         page_text_blocks: Dict[int, str] = {}
         page_table_blocks: Dict[int, List[str]] = {}
 
@@ -223,6 +247,7 @@ class DocumentProcessorAgent(BaseAgent):
     ) -> Tuple[List[Dict], Optional[str], str, bool]:
         """Scan one ordered text block and carry section state forward."""
         candidates: List[Dict] = []
+        column_layout: Optional[Dict[str, int]] = None
 
         for line_num, raw_line in enumerate(block_text.splitlines(), 1):
             line = raw_line.strip()
@@ -247,7 +272,23 @@ class DocumentProcessorAgent(BaseAgent):
 
             if not scan_enabled:
                 continue
-            if self._is_header_or_footer(line):
+
+            detected_layout = self._detect_column_layout(line)
+            if detected_layout:
+                column_layout = detected_layout
+
+            row_type = self._classify_non_transaction_row(line)
+            if row_type:
+                if self._line_has_date_and_amount(line) or row_type in {
+                    'opening_balance', 'closing_balance', 'aggregate'
+                }:
+                    self._last_excluded_rows.append({
+                        'text': line,
+                        'row_type': row_type,
+                        'page': page_num,
+                        'source': source,
+                        'source_line_number': line_num,
+                    })
                 continue
             if not self._looks_like_transaction(line):
                 continue
@@ -259,6 +300,9 @@ class DocumentProcessorAgent(BaseAgent):
                 'statement_section': current_section,
                 'section_label': current_section_label,
                 'source_line_number': line_num,
+                'column_direction': self._infer_direction_from_columns(
+                    line, column_layout
+                ),
             })
             print(
                 f"   ✅ Page {page_num or '?'} line {line_num}: "
@@ -266,6 +310,119 @@ class DocumentProcessorAgent(BaseAgent):
             )
 
         return candidates, current_section, current_section_label, scan_enabled
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        """Normalize labels without altering the original transaction text."""
+        decomposed = unicodedata.normalize('NFKD', str(value or ''))
+        ascii_text = ''.join(ch for ch in decomposed if not unicodedata.combining(ch))
+        return re.sub(r'\s+', ' ', ascii_text).strip().casefold()
+
+    def _classify_non_transaction_row(self, line: str) -> Optional[str]:
+        """Classify headers and aggregates before transaction parsing.
+
+        Rules are anchored to the row label so legitimate descriptions such as
+        ``Transfer to savings account`` are not discarded merely because they
+        contain the word ``account``.
+        """
+        cleaned = re.sub(r'^ROW_\d+:\s*', '', line, flags=re.IGNORECASE).strip()
+        normalized = self._normalize_text(cleaned)
+        normalized = re.sub(
+            r'^\d{1,4}[/-]\d{1,2}(?:[/-]\d{1,4})?\s+', '', normalized
+        )
+        label = normalized.lstrip('-:| ')
+
+        if re.match(
+            r'^(?:your\s+)?(?:beginning|opening|previous|starting) balance\b|'
+            r'^(?:saldo inicial|saldo anterior|balance inicial)\b',
+            label,
+        ):
+            return 'opening_balance'
+        if re.match(
+            r'^(?:your\s+)?(?:ending|closing|new|current) balance\b|'
+            r'^(?:saldo final|saldo de cierre|balance final)\b',
+            label,
+        ):
+            return 'closing_balance'
+        if re.match(
+            r'^(?:total|subtotal|summary|resumen|totales|average daily balance|'
+            r'promedio de saldo)\b',
+            label,
+        ):
+            return 'aggregate'
+
+        header_patterns = [
+            r'^(?:date|fecha)\s+(?:transaction )?(?:description|descripcion)',
+            r'^(?:account transactions|transaction history|account activity|'
+            r'transaction detail|detalle de transacciones)$',
+            r'^(?:account|statement|balance information|statement period|issue date)\s*:',
+            r'^(?:cartola|cuenta|periodo|periodo de cartola)\s*:',
+            r'^(?:page|pagina)\s+\d+\b',
+            r'^(?:paid in|paid out|payment type|account holder)\b',
+            r'^(?:note|nota)\s*:',
+            r'^[-=_]+$',
+        ]
+        if any(re.search(pattern, label) for pattern in header_patterns):
+            return 'header_footer'
+        return None
+
+    def _line_has_date_and_amount(self, line: str) -> bool:
+        return bool(
+            re.search(
+                r'\b(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|'
+                r'\d{4}[/-]\d{1,2}[/-]\d{1,2})\b',
+                line,
+            )
+            and re.search(self._amount_pattern(), line)
+        )
+
+    def _detect_column_layout(self, line: str) -> Optional[Dict[str, int]]:
+        """Capture debit/credit column positions from a table header."""
+        normalized = self._normalize_text(line)
+        if not re.search(r'\b(?:date|fecha)\b', normalized):
+            return None
+
+        aliases = {
+            'debit': ('withdrawals', 'withdrawal', 'debits', 'debit', 'cargos', 'cargo', 'retiros', 'retiro'),
+            'credit': ('deposits', 'deposit', 'credits', 'credit', 'abonos', 'abono', 'ingresos', 'ingreso'),
+            'balance': ('balance', 'saldo'),
+        }
+        positions: Dict[str, int] = {}
+        decomposed = unicodedata.normalize('NFKD', str(line or ''))
+        lower_line = ''.join(
+            ch for ch in decomposed if not unicodedata.combining(ch)
+        ).casefold()
+        for field, names in aliases.items():
+            found = [lower_line.find(name) for name in names if lower_line.find(name) >= 0]
+            if found:
+                positions[field] = min(found)
+        if 'debit' in positions and 'credit' in positions:
+            return positions
+        return None
+
+    def _infer_direction_from_columns(
+        self, line: str, column_layout: Optional[Dict[str, int]]
+    ) -> Optional[str]:
+        if not column_layout:
+            return None
+        date_match = re.search(
+            r'\b(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|'
+            r'\d{4}[/-]\d{1,2}[/-]\d{1,2})\b',
+            line,
+        )
+        if not date_match:
+            return None
+        amount_matches = list(re.finditer(self._amount_pattern(), line[date_match.end():]))
+        if not amount_matches:
+            return None
+        transaction_match = amount_matches[-2] if len(amount_matches) >= 2 else amount_matches[0]
+        amount_position = date_match.end() + transaction_match.start()
+        choices = [
+            (abs(amount_position - position), direction)
+            for direction, position in column_layout.items()
+            if direction in {'debit', 'credit'}
+        ]
+        return min(choices)[1] if choices else None
 
     def _detect_section_event(self, line: str) -> Optional[Tuple[str, Optional[str], str]]:
         """Recognize deterministic credit/debit section boundaries."""
@@ -338,30 +495,17 @@ class DocumentProcessorAgent(BaseAgent):
         return any(re.fullmatch(pattern, compact) for pattern in compact_patterns)
     
     def _is_header_or_footer(self, line: str) -> bool:
-        """Skip lines that are obviously NOT transactions"""
-        line_lower = line.lower()
-        
-        # Skip header/footer patterns (not anchored to ^ so they match anywhere)
-        skip_patterns = [
-            r'(account|statement|balance information|date|description|amount|type)',
-            r'(cartola|cuenta|saldo anterior|saldo final|saldo inicial|fecha|descripcion|descripci[oó]n|monto|abono|cargo)',
-            r'(page \d+|statement period|issue date)',
-            r'(opening balance|previous balance|new balance|ending balance|current balance|closing balance)',
-            # Note: Interest earned DEPOSITS are kept if they have amount; fees are kept too
-            r'(interest paid)',  # Skip only interest PAID (fees/charges)
-            r'(note:|total|summary)',
-            r'(paid in|paid out|detail|payment type|account holder)',
-            r'(date\s+description|description.*type|type.*amount)',  # Table headers
-            r'^\s*$',  # Empty lines
-            r'^-+$',   # Separator lines like "----------"
-            r'^=+$'    # Separator lines like "=========="
-        ]
-        
-        for pattern in skip_patterns:
-            if re.search(pattern, line_lower):
-                return True
-        
-        return False
+        """Backwards-compatible wrapper for structural row classification."""
+        return self._classify_non_transaction_row(line) is not None
+
+    @staticmethod
+    def _amount_pattern() -> str:
+        """Return the shared strict monetary-token pattern."""
+        return (
+            r'[-+]?\$?\s*\d{1,3}(?:[\.,]\d{3})+(?:[\.,]\d{2})?'
+            r'|[-+]?\$\s*\d+(?:[\.,]\d{2})?'
+            r'|[-+]?\s*\d+[\.,]\d{2}'
+        )
     
     def _looks_like_transaction(self, line: str) -> bool:
         """
@@ -373,8 +517,7 @@ class DocumentProcessorAgent(BaseAgent):
         has_date = bool(re.search(date_pattern, line))
         
         # Must have an amount pattern (strictly requiring either $ or decimal part)
-        amount_pattern = r'[-+]?\$?\s*\d{1,3}(?:[\.,]\d{3})+(?:[\.,]\d{2})?|[-+]?\$\s*\d+(?:[\.,]\d{2})?|[-+]?\s*\d+[\.,]\d{2}'
-        has_amount = bool(re.search(amount_pattern, line))
+        has_amount = bool(re.search(self._amount_pattern(), line))
         
         # Must have some description text (not just numbers/symbols)
         has_description = bool(re.search(r'[A-Za-zÀ-ÿ]{3,}', line))
@@ -394,20 +537,31 @@ class DocumentProcessorAgent(BaseAgent):
             if isinstance(candidate, dict):
                 line = str(candidate.get('text', ''))
                 statement_section = candidate.get('statement_section')
+                column_direction = candidate.get('column_direction')
             else:
                 line = str(candidate)
                 statement_section = None
+                column_direction = None
             try:
                 parsed = self._parse_single_transaction(line)
                 if parsed:
                     if statement_section == 'deposits_credits_interest':
                         parsed['is_debit'] = False
                         parsed['direction_source'] = 'section_header'
+                        parsed['direction_known'] = True
+                        parsed['direction_confidence'] = 0.99
                     elif statement_section == 'withdrawals_debits_charges':
                         parsed['is_debit'] = True
                         parsed['direction_source'] = 'section_header'
+                        parsed['direction_known'] = True
+                        parsed['direction_confidence'] = 0.99
+                    elif column_direction in {'debit', 'credit'}:
+                        parsed['is_debit'] = column_direction == 'debit'
+                        parsed['direction_source'] = 'amount_column'
+                        parsed['direction_known'] = True
+                        parsed['direction_confidence'] = 0.99
                     else:
-                        parsed['direction_source'] = 'line_heuristic'
+                        parsed.setdefault('direction_source', 'line_heuristic')
 
                     if isinstance(candidate, dict):
                         parsed['statement_section'] = statement_section
@@ -504,8 +658,7 @@ class DocumentProcessorAgent(BaseAgent):
         parsed_date = self._parse_date(date_str)
         after_date = line[date_match.end():].strip()
 
-        amount_pattern = r'[-+]?\$?\s*\d{1,3}(?:[\.,]\d{3})+(?:[\.,]\d{2})?|[-+]?\$\s*\d+(?:[\.,]\d{2})?|[-+]?\s*\d+[\.,]\d{2}'
-        amount_matches = list(re.finditer(amount_pattern, after_date))
+        amount_matches = list(re.finditer(self._amount_pattern(), after_date))
         if not amount_matches:
             return None
 
@@ -526,7 +679,7 @@ class DocumentProcessorAgent(BaseAgent):
             return None
 
         amount = self._parse_amount(amount_str)
-        is_debit = self._is_debit_transaction(amount_str, line)
+        direction = self._infer_line_direction(amount_str, line)
 
         balance = 0.0
         if amount_idx + 1 < len(amount_matches):
@@ -536,8 +689,12 @@ class DocumentProcessorAgent(BaseAgent):
             'date': parsed_date.strftime('%Y-%m-%d'),
             'description': description,
             'amount': abs(amount),
-            'is_debit': is_debit,
+            'is_debit': direction['is_debit'],
+            'direction_known': direction['known'],
+            'direction_source': direction['source'],
+            'direction_confidence': direction['confidence'],
             'balance': balance,
+            'has_running_balance': amount_idx + 1 < len(amount_matches),
             'category': 'uncategorized',
             'confidence': 0.0,
             'source': 'deterministic',
@@ -564,20 +721,27 @@ class DocumentProcessorAgent(BaseAgent):
         # Extract amount
         amount_str = groups[group_map['amount'] - 1]
         amount = self._parse_amount(amount_str)
-        is_debit = self._is_debit_transaction(amount_str, original_line)
+        direction = self._infer_line_direction(amount_str, original_line)
         
         # Extract balance (if available)
         balance = 0.0
+        has_running_balance = False
         if 'balance' in group_map and len(groups) >= group_map['balance']:
             balance_str = groups[group_map['balance'] - 1]
-            balance = self._parse_amount(balance_str)
+            if balance_str:
+                balance = self._parse_amount(balance_str)
+                has_running_balance = True
         
         return {
             'date': parsed_date.strftime('%Y-%m-%d'),
             'description': description,
             'amount': abs(amount),  # Always positive, use is_debit flag
-            'is_debit': is_debit,
+            'is_debit': direction['is_debit'],
+            'direction_known': direction['known'],
+            'direction_source': direction['source'],
+            'direction_confidence': direction['confidence'],
             'balance': balance,
+            'has_running_balance': has_running_balance,
             'category': 'uncategorized',  # Will be set later
             'confidence': 0.0,
             'source': 'deterministic',
@@ -690,6 +854,144 @@ class DocumentProcessorAgent(BaseAgent):
             return None
         return min(in_window, key=lambda candidate: abs((end_date - candidate).days))
 
+    def _infer_statement_balance_hints(
+        self, text: str
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Read opening and closing balances without treating them as movements."""
+        normalized = re.sub(r'\s+', ' ', str(text or ''))
+        amount = r'([-$+]?\s*\$?\s*[\d.,]+)'
+        opening_patterns = [
+            rf'(?:beginning|opening|previous|starting) balance(?:\s+as\s+of\s+[\d/-]+)?\s*:?\s*{amount}',
+            rf'(?:saldo inicial|saldo anterior|balance inicial)\s*:?\s*{amount}',
+        ]
+        closing_patterns = [
+            rf'(?:ending|closing|new) balance(?:\s+as\s+of\s+[\d/-]+)?\s*:?\s*{amount}',
+            rf'(?:saldo final|saldo de cierre|balance final)\s*:?\s*{amount}',
+        ]
+
+        def first_value(patterns: List[str]) -> Optional[float]:
+            for pattern in patterns:
+                match = re.search(pattern, normalized, flags=re.IGNORECASE)
+                if match:
+                    return abs(self._parse_amount(match.group(1)))
+            return None
+
+        return first_value(opening_patterns), first_value(closing_patterns)
+
+    def _infer_statement_profile(self, text: str, pdf_path: str) -> Tuple[str, str]:
+        """Identify a conservative parser profile from document-owned evidence."""
+        file_text = str(pdf_path or '').casefold()
+        page_text_match = re.search(
+            r'--- PAGE \d+ TEXT ---\s*(.*?)(?:--- END PAGE|$)',
+            str(text or ''),
+            flags=re.DOTALL,
+        )
+        header_text = page_text_match.group(1) if page_text_match else str(text or '')
+        header_text = re.split(
+            r'\b(?:account transactions|transaction history|account activity|'
+            r'transaction detail|detalle de transacciones)\b',
+            header_text,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        haystack = f"{file_text}\n{header_text[:4000]}".casefold()
+        kind = 'credit_card' if re.search(
+            r'\b(?:credit card|tarjeta de credito|tarjeta de crédito)\b', haystack
+        ) else 'bank_account'
+
+        institutions = [
+            ('wells fargo', 'wells_fargo'),
+            ('chase', 'chase'),
+            ('bank of america', 'bank_of_america'),
+            ('santander', 'santander'),
+            ('scotiabank', 'scotiabank'),
+            ('bancoestado', 'bancoestado'),
+            ('bbva', 'bbva'),
+            ('bci', 'bci'),
+            ('itau', 'itau'),
+            ('itaú', 'itau'),
+        ]
+        institution = next(
+            (code for marker, code in institutions if marker in file_text),
+            None,
+        )
+        if institution is None:
+            institution = next(
+                (code for marker, code in institutions if marker in haystack),
+                'generic',
+            )
+        return f'{institution}_{kind}', kind
+
+    def _reconcile_transaction_directions(self, transactions: List[Dict]) -> Dict:
+        """Validate direction against running-balance changes when available."""
+        previous_balance = self._opening_balance_hint
+        verified = 0
+        conflicts = 0
+        unexplained = 0
+
+        for transaction in transactions:
+            transaction['statement_profile'] = self._statement_profile
+            transaction['statement_kind'] = self._statement_kind
+            transaction.setdefault('direction_conflict', False)
+            transaction.setdefault('direction_known', False)
+            transaction.setdefault('direction_confidence', 0.0)
+
+            if self._statement_kind != 'bank_account':
+                continue
+            if not transaction.get('has_running_balance'):
+                continue
+
+            current_balance = float(transaction.get('balance') or 0.0)
+            amount = float(transaction.get('amount') or 0.0)
+            if previous_balance is not None:
+                delta = current_balance - previous_balance
+                tolerance = max(0.02, amount * 0.00001)
+                if abs(abs(delta) - amount) <= tolerance:
+                    balance_is_debit = delta < 0
+                    if (
+                        transaction.get('direction_known')
+                        and bool(transaction.get('is_debit')) != balance_is_debit
+                    ):
+                        transaction['direction_conflict'] = True
+                        conflicts += 1
+                    transaction['is_debit'] = balance_is_debit
+                    transaction['direction_known'] = True
+                    transaction['direction_source'] = 'running_balance'
+                    transaction['direction_confidence'] = 1.0
+                    transaction['verified_by_running_balance'] = True
+                    verified += 1
+                else:
+                    transaction['balance_delta_difference'] = round(
+                        abs(abs(delta) - amount), 2
+                    )
+                    unexplained += 1
+            previous_balance = current_balance
+
+        known = [t for t in transactions if t.get('direction_known')]
+        debits = sum(float(t.get('amount') or 0.0) for t in known if t.get('is_debit'))
+        credits = sum(float(t.get('amount') or 0.0) for t in known if not t.get('is_debit'))
+        computed_closing = None
+        difference = None
+        if self._opening_balance_hint is not None:
+            computed_closing = self._opening_balance_hint + credits - debits
+            if self._closing_balance_hint is not None:
+                difference = computed_closing - self._closing_balance_hint
+
+        return {
+            'profile': self._statement_profile,
+            'opening_balance': self._opening_balance_hint,
+            'closing_balance': self._closing_balance_hint,
+            'computed_closing_balance': computed_closing,
+            'difference': difference,
+            'directions_verified_by_balance': verified,
+            'direction_conflicts_resolved': conflicts,
+            'unexplained_balance_changes': unexplained,
+            'unknown_direction_count': sum(
+                not bool(t.get('direction_known')) for t in transactions
+            ),
+            'reconciled': difference is not None and abs(difference) <= 0.02,
+        }
+
     def _parse_amount(self, amount_str: str) -> float:
         """Clean and parse amount string"""
         clean_amount = amount_str.strip()
@@ -728,34 +1030,48 @@ class DocumentProcessorAgent(BaseAgent):
             return 0.0
 
     def _is_debit_transaction(self, amount_str: str, line: str) -> bool:
-        """Determine if transaction is debit (money going out)"""
-        
-        # Check for explicit negative signs
-        if amount_str.startswith('-') or amount_str.startswith('+'):
-            return amount_str.startswith('-')
+        """Compatibility wrapper around evidence-bearing direction inference."""
+        return bool(self._infer_line_direction(amount_str, line)['is_debit'])
 
-        # Common banking indicators in line or amount
-        if re.search(r'\b(db|dr|debit|cargo|compra|egreso|withdrawal|payment|fee|charge)\b', line.lower()):
-            return True
-        if re.search(r'\b(cr|abono|credito|credit|deposit|salary|refund|income)\b', line.lower()):
-            return False
-        
-        # Check for debit indicators in the line
-        debit_keywords = ['withdrawal', 'purchase', 'payment', 'fee', 'charge', 'cargo', 'compra', 'egreso']
-        line_lower = line.lower()
-        
-        for keyword in debit_keywords:
-            if keyword in line_lower:
-                return True
-        
-        # Check for credit indicators
-        credit_keywords = ['deposit', 'interest', 'refund', 'credit', 'salary', 'abono', 'credito', 'ingreso']
-        for keyword in credit_keywords:
-            if keyword in line_lower:
-                return False
-        
-        # Default to debit for most transactions
-        return True
+    def _infer_line_direction(self, amount_str: str, line: str) -> Dict:
+        """Infer direction while preserving whether the conclusion is reliable."""
+        stripped_amount = str(amount_str or '').strip()
+        if stripped_amount.startswith('-') or stripped_amount.startswith('+'):
+            return {
+                'is_debit': stripped_amount.startswith('-'),
+                'known': True,
+                'source': 'explicit_sign',
+                'confidence': 1.0,
+            }
+
+        normalized = self._normalize_text(line)
+        debit_pattern = (
+            r'\b(?:db|dr|debit|withdrawal|purchase|payment|fee|charge|cargo|'
+            r'compra|egreso|retiro|cashout)\b'
+        )
+        credit_pattern = (
+            r'\b(?:cr|credit|deposit|direct\s+dep|dep\s+direct|salary|payroll|'
+            r'refund|income|abono|credito|ingreso|nomina|devolucion)\b'
+        )
+        debit_match = bool(re.search(debit_pattern, normalized))
+        credit_match = bool(re.search(credit_pattern, normalized))
+        if debit_match != credit_match:
+            return {
+                'is_debit': debit_match,
+                'known': True,
+                'source': 'line_heuristic',
+                'evidence': 'keyword',
+                'confidence': 0.80,
+            }
+
+        # Retain a boolean for backwards compatibility, but mark it unknown so
+        # downstream totals can fail closed instead of silently counting it.
+        return {
+            'is_debit': True,
+            'known': False,
+            'source': 'unknown',
+            'confidence': 0.0,
+        }
     
     def _apply_basic_categorization(self, transactions: List[Dict]) -> List[Dict]:
         """

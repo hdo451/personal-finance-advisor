@@ -166,6 +166,10 @@ class BankStatementAnalyzer:
                     'document_id': normalized_metadata['document_id'],
                     'file_name': normalized_metadata['file_name'],
                     'parsing_stats': doc_result.get('parsing_stats', {}),
+                    'statement_profile': doc_result.get('statement_profile', ''),
+                    'reconciliation': doc_result.get('reconciliation', {}),
+                    'excluded_row_count': len(doc_result.get('excluded_rows', [])),
+                    'sample_excluded_rows': doc_result.get('excluded_rows', [])[:10],
                     'sample_transaction_lines': doc_result.get('raw_transaction_lines', [])[:10],
                 })
 
@@ -228,13 +232,38 @@ class BankStatementAnalyzer:
         metadata_hint: Dict,
         index: int,
     ) -> Dict:
-        file_name = os.path.basename(pdf_path)
-        document_type = self._detect_document_type(file_name, metadata_hint.get('document_type'))
+        file_name = (
+            str(metadata_hint.get('file_name') or '').strip()
+            or os.path.basename(pdf_path)
+        )
+        detected_kind = doc_result.get('statement_kind')
+        document_type = self._detect_document_type(
+            file_name,
+            metadata_hint.get('document_type') or detected_kind,
+        )
         min_date, max_date = self._detect_statement_date_range(transactions)
+        profile_code = re.sub(
+            r'_(?:bank_account|credit_card)$',
+            '',
+            str(doc_result.get('statement_profile') or ''),
+        )
+        profile_labels = {
+            'wells_fargo': 'Wells Fargo',
+            'chase': 'Chase',
+            'bank_of_america': 'Bank of America',
+            'santander': 'Santander',
+            'scotiabank': 'Scotiabank',
+            'bancoestado': 'BancoEstado',
+            'bbva': 'BBVA',
+            'bci': 'BCI',
+            'itau': 'Itaú',
+        }
         institution = self._detect_financial_institution(
             doc_result.get('raw_transaction_lines', []),
             file_name,
-            metadata_hint.get('institution')
+            metadata_hint.get('institution') or (
+                profile_labels.get(profile_code)
+            ),
         )
 
         person = (metadata_hint.get('person') or 'default').strip() or 'default'
@@ -249,6 +278,8 @@ class BankStatementAnalyzer:
             'person': person,
             'account_label': account_label,
             'institution': institution,
+            'statement_profile': doc_result.get('statement_profile', 'generic_bank_account'),
+            'reconciliation': doc_result.get('reconciliation', {}),
             'date_range': {
                 'start': min_date,
                 'end': max_date,
@@ -317,12 +348,22 @@ class BankStatementAnalyzer:
             normalized_txn['person'] = metadata['person']
             normalized_txn['account_label'] = metadata['account_label']
             normalized_txn['institution'] = metadata['institution']
+            normalized_txn['statement_profile'] = metadata.get('statement_profile', '')
             normalized_txn['statement_date_start'] = metadata['date_range']['start']
             normalized_txn['statement_date_end'] = metadata['date_range']['end']
             normalized_txn['local_txn_id'] = txn.get('transaction_id') or f"txn_{idx}"
             normalized_txn['transaction_id'] = f"{metadata['document_id']}::{normalized_txn['local_txn_id']}"
-            normalized_txn['effective_is_spending'] = bool(txn.get('is_debit', False))
-            normalized_txn['effective_is_income'] = not bool(txn.get('is_debit', False))
+            direction_known = bool(txn.get('direction_known', True))
+            normalized_txn['direction_known'] = direction_known
+            normalized_txn['effective_is_spending'] = (
+                direction_known and bool(txn.get('is_debit', False))
+            )
+            normalized_txn['effective_is_income'] = (
+                direction_known and not bool(txn.get('is_debit', False))
+            )
+            normalized_txn['excluded_from_totals'] = not direction_known
+            if not direction_known:
+                normalized_txn['exclusion_reason'] = 'Transaction direction is unresolved'
 
             date_text = str(txn.get('date') or '').strip()
             normalized_txn['month'] = date_text[:7] if len(date_text) >= 7 else 'unknown'
@@ -335,6 +376,12 @@ class BankStatementAnalyzer:
         desc = str(transaction.get('description') or '').lower()
         is_debit = bool(transaction.get('is_debit', False))
         doc_type = transaction.get('document_type', 'other')
+
+        if not transaction.get('direction_known', True):
+            transaction['movement_type'] = 'unknown_direction'
+            transaction['effective_is_spending'] = False
+            transaction['effective_is_income'] = False
+            return transaction
 
         movement_type = 'other'
         if doc_type == 'credit_card':
@@ -357,7 +404,7 @@ class BankStatementAnalyzer:
         else:
             if is_debit and any(k in desc for k in ['payment', 'pago', 'tarjeta', 'credit card', 'tc']):
                 movement_type = 'possible_card_payment'
-            elif any(k in desc for k in [
+            elif (not is_debit) and any(k in desc for k in [
                 'online transfer from',
                 'transfer from',
                 'deposit',
@@ -452,9 +499,10 @@ class BankStatementAnalyzer:
 
             explicit_internal_markers = [
                 'internal transfer',
-                'between accounts',
                 'between my accounts',
                 'own account',
+                'transfer to my account',
+                'transfer from my account',
                 'online transfer to',
                 'online transfer from',
                 'online banking transfer to',
@@ -467,7 +515,6 @@ class BankStatementAnalyzer:
                 'transfer from savings',
                 'traspaso propio',
                 'traspaso entre cuentas',
-                'transferencia entre cuentas',
                 'transferencia entre mis cuentas',
                 'transferencia a cuenta propia',
                 'transferencia desde cuenta propia',
@@ -495,17 +542,33 @@ class BankStatementAnalyzer:
         detections: List[bool],
         reasons: List[List[str]],
     ) -> None:
-        """Match opposite same-amount movements across uploaded accounts."""
+        """Match opposite movements using account, amount, date and text evidence."""
         generic_markers = ('transfer', 'transferencia', 'traspaso', 'xfer')
         international_markers = ('international', 'internacional', 'swift', 'wire')
+        movement_markers = (
+            'ach', 'deposit', 'withdrawal', 'online banking', 'zelle', 'venmo',
+            'cash transfer', 'abono', 'retiro', 'cargo cuenta',
+        )
+        external_income_markers = (
+            'salary', 'payroll', 'nomina', 'nómina', 'refund', 'reembolso',
+            'interest', 'dividend', 'pension', 'pensión',
+        )
         candidates = []
 
         for left_index, left in enumerate(transactions):
             for right_index in range(left_index + 1, len(transactions)):
                 right = transactions[right_index]
+                if not left.get('direction_known', True) or not right.get('direction_known', True):
+                    continue
                 if bool(left.get('is_debit')) == bool(right.get('is_debit')):
                     continue
                 if left.get('source_document_id') == right.get('source_document_id'):
+                    continue
+                if (left.get('person') or 'default') != (right.get('person') or 'default'):
+                    continue
+                left_currency = left.get('currency') or 'unknown'
+                right_currency = right.get('currency') or 'unknown'
+                if left_currency != right_currency:
                     continue
                 if abs(float(left.get('amount') or 0.0) - float(right.get('amount') or 0.0)) > 0.01:
                     continue
@@ -515,8 +578,6 @@ class BankStatementAnalyzer:
                     str(right.get('description') or '').lower(),
                 )
                 combined = ' '.join(descriptions)
-                if not any(marker in combined for marker in generic_markers):
-                    continue
                 if any(marker in combined for marker in international_markers):
                     continue
 
@@ -529,24 +590,59 @@ class BankStatementAnalyzer:
                 date_gap = abs((left_date - right_date).days)
                 if date_gap > 3:
                     continue
-                marker_count = sum(
+
+                generic_count = sum(
                     any(marker in description for marker in generic_markers)
                     for description in descriptions
                 )
-                candidates.append((-marker_count, date_gap, left_index, right_index))
+                movement_count = sum(
+                    any(marker in description for marker in movement_markers)
+                    for description in descriptions
+                )
+                left_refs = set(re.findall(r'\b\d{4,}\b', descriptions[0]))
+                right_refs = set(re.findall(r'\b\d{4,}\b', descriptions[1]))
+                shared_reference = bool(left_refs & right_refs)
+                external_income = any(
+                    marker in combined for marker in external_income_markers
+                )
+
+                accepted = (
+                    generic_count >= 1
+                    or shared_reference
+                    or (
+                        movement_count == 2
+                        and date_gap <= 1
+                        and not external_income
+                    )
+                )
+                if not accepted:
+                    continue
+
+                score = (
+                    generic_count * 3
+                    + movement_count
+                    + (3 if shared_reference else 0)
+                    - date_gap * 0.25
+                )
+                candidates.append((-score, date_gap, left_index, right_index))
 
         matched = set()
-        for _, date_gap, left_index, right_index in sorted(candidates):
+        pair_number = 0
+        for negative_score, date_gap, left_index, right_index in sorted(candidates):
             if left_index in matched or right_index in matched:
                 continue
             matched.update((left_index, right_index))
+            pair_number += 1
+            pair_id = f'internal_transfer_pair_{pair_number}'
             reason = (
                 'Opposite account movements with the same amount '
-                f'within {date_gap} day(s)'
+                f'within {date_gap} day(s); evidence score={-negative_score:.2f}'
             )
             for index in (left_index, right_index):
                 detections[index] = True
                 reasons[index].append(reason)
+                transactions[index]['transfer_pair_id'] = pair_id
+                transactions[index]['transfer_match_score'] = -negative_score
 
     def aggregate_by_month(self, transactions: List[Dict]) -> List[Dict]:
         monthly = {}

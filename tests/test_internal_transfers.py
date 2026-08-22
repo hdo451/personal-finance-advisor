@@ -139,6 +139,54 @@ def test_same_amount_opposite_movements_across_accounts_are_paired():
     assert all(not txn["effective_is_spending"] for txn in transactions)
     assert all(not txn["effective_is_income"] for txn in transactions)
     assert all(txn["category"] == INTERNAL_TRANSFER_CATEGORY for txn in transactions)
+    assert transactions[0]["transfer_pair_id"] == transactions[1]["transfer_pair_id"]
+
+
+def test_matching_ach_movements_can_pair_without_transfer_word():
+    debit = _transaction(
+        description="ACH withdrawal checking 7744",
+        source_document_id="checking",
+        person="owner",
+    )
+    credit = _transaction(
+        date="2026-07-11",
+        description="ACH deposit savings 7744",
+        is_debit=False,
+        effective_is_spending=False,
+        effective_is_income=True,
+        source_document_id="savings",
+        person="owner",
+    )
+
+    transactions = [debit, credit]
+    _detect(transactions)
+
+    assert all(txn["detected_internal_transfer"] for txn in transactions)
+    assert transactions[0]["transfer_pair_id"] == transactions[1]["transfer_pair_id"]
+
+
+def test_same_amount_movements_for_different_people_are_not_paired():
+    debit = _transaction(
+        description="Transfer to savings",
+        source_document_id="checking",
+        person="person_a",
+    )
+    credit = _transaction(
+        description="Deposit",
+        is_debit=False,
+        effective_is_spending=False,
+        effective_is_income=True,
+        source_document_id="savings",
+        person="person_b",
+    )
+
+    transactions = [debit, credit]
+    _detect(transactions)
+
+    # The explicit debit remains detectable from its own description, but it
+    # must not be linked to a different person's credit.
+    assert "transfer_pair_id" not in debit
+    assert credit["detected_internal_transfer"] is False
 
 
 def test_international_transfer_pair_is_not_treated_as_internal():
@@ -245,7 +293,7 @@ def test_category_editor_marks_and_unmarks_internal_transfer():
     )
 
     assert marked["row_changed"] is True
-    assert marked["rule_category"] == INTERNAL_TRANSFER_CATEGORY
+    assert marked["rule_category"] is None
     assert transaction["category"] == INTERNAL_TRANSFER_CATEGORY
     assert transaction["internal_transfer_override"] == TRANSFER_OVERRIDE_TRANSFER
     assert transaction["effective_is_spending"] is False
@@ -263,3 +311,22 @@ def test_category_editor_marks_and_unmarks_internal_transfer():
     assert transaction["category"] == "groceries"
     assert transaction["internal_transfer_override"] == TRANSFER_OVERRIDE_NORMAL
     assert transaction["effective_is_spending"] is True
+
+
+def test_editor_can_correct_transaction_direction_deterministically():
+    transaction = _transaction(description="Ambiguous account movement")
+
+    outcome = _apply_transaction_review_row(
+        transaction,
+        {
+            "Categoría": "Otros",
+            "Tipo": "INGRESO",
+        },
+    )
+
+    assert outcome["direction_changed"] is True
+    assert transaction["is_debit"] is False
+    assert transaction["direction_known"] is True
+    assert transaction["direction_source"] == "user_review"
+    assert transaction["effective_is_spending"] is False
+    assert transaction["effective_is_income"] is True

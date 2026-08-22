@@ -99,6 +99,15 @@ graph TD
 📊 Agent 3: Financial analysis → ✍️ Human category review (optional edits) → 🧠 Meta analysis button (optional) → 🎨 Beautiful dashboard
 ```
 
+### Deterministic statement integrity
+
+- Balance, subtotal, total, summary, and header rows are classified and excluded before transaction parsing.
+- Debit/credit direction is derived from explicit columns, signs, section headers, keywords, and running-balance reconciliation.
+- An unresolved direction is retained for review but excluded from income and spending totals.
+- Parser diagnostics show the detected statement profile, reconciliation result, and a redacted sample of excluded rows.
+- The transaction editor allows a user to correct income/expense direction and internal-transfer treatment without changing the source PDF.
+- Internal transfers are matched only across accounts owned by the same person and retain a traceable pair ID.
+
 ### Problemas cotidianos v2: Parser + Calculator
 
 ```
@@ -287,6 +296,18 @@ Finances_Advisor/
 ---
 
 ## 🧪 Testing
+
+Local tests do not call OpenAI by default:
+
+```bash
+python -m pytest -q
+```
+
+Live API integration tests require explicit opt-in:
+
+```bash
+RUN_OPENAI_INTEGRATION_TESTS=1 python -m pytest -q
+```
 
 ### Run Tests
 ```bash

@@ -49,7 +49,6 @@ class ContentAnalyzerAgent(BaseAgent):
             'other_income': 'Alternative earnings explicitly identified as freelance, professional services, rental, or other income',
             'international_transfer_in': 'International transfer or SWIFT payment received from abroad',
             'international_transfer_out': 'International transfer or SWIFT payment sent abroad',
-            'internal_transfer': 'Transfer between accounts owned by the same user; not income or spending',
             'fees': 'Bank fees, penalties, service charges, maintenance fees',
             'other': 'Transactions that don\'t clearly fit other categories'
         }
@@ -63,15 +62,31 @@ class ContentAnalyzerAgent(BaseAgent):
         
         # Separate already categorized vs needs LLM
         already_categorized = [t for t in transactions if t['category'] != 'uncategorized']
-        needs_llm = [t for t in transactions if t['category'] == 'uncategorized']
+        unresolved_direction = [
+            t for t in transactions
+            if t['category'] == 'uncategorized'
+            and not t.get('direction_known', True)
+        ]
+        needs_llm = [
+            t for t in transactions
+            if t['category'] == 'uncategorized'
+            and t.get('direction_known', True)
+        ]
+
+        for txn in unresolved_direction:
+            txn['category'] = 'other'
+            txn['confidence'] = 0.0
+            txn['source'] = 'deterministic_guardrail'
+            txn['reasoning'] = 'Direction unresolved; excluded from financial totals'
         
         print(f"\n🧠 {self.name} processing:")
         print(f"   ✅ Already categorized: {len(already_categorized)}")
+        print(f"   ⚠️ Direction unresolved: {len(unresolved_direction)}")
         print(f"   🤖 Needs LLM analysis: {len(needs_llm)}")
         
         if not needs_llm:
             print("   🎉 No LLM call needed - all transactions already categorized!")
-            return already_categorized
+            return transactions
         
         print(f"   🚀 Categorizing {len(needs_llm)} transactions with LLM...")
         before_calls = self.llm.call_count
@@ -81,7 +96,9 @@ class ContentAnalyzerAgent(BaseAgent):
         
         print(f"   ✅ LLM categorization complete! Calls used: {used_calls}")
         
-        return already_categorized + llm_categorized
+        # Categorization mutates the original transaction dictionaries. Return
+        # the original list so statement order and transaction IDs remain stable.
+        return transactions
     
     def _batch_categorize_with_llm(self, transactions: List[Dict]) -> List[Dict]:
         """
@@ -108,6 +125,7 @@ class ContentAnalyzerAgent(BaseAgent):
                 'description': txn['description'],
                 'amount': txn['amount'],
                 'is_debit': txn['is_debit'],
+                'direction_source': txn.get('direction_source', ''),
                 'date': txn['date']
             })
 
@@ -128,7 +146,38 @@ Return ONLY valid JSON with this exact structure:
         user_prompt = f"Categorize these unclear transactions:\n{json.dumps(transaction_data, indent=2)}"
 
         try:
-            response = self.llm.make_call(user_prompt, system_prompt, expect_json=True)
+            response_schema = {
+                'type': 'object',
+                'properties': {
+                    'categorizations': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'transaction_id': {'type': 'string'},
+                                'category': {
+                                    'type': 'string',
+                                    'enum': list(self.valid_categories),
+                                },
+                                'confidence': {'type': 'number'},
+                                'reasoning': {'type': 'string'},
+                            },
+                            'required': [
+                                'transaction_id', 'category', 'confidence', 'reasoning'
+                            ],
+                            'additionalProperties': False,
+                        },
+                    }
+                },
+                'required': ['categorizations'],
+                'additionalProperties': False,
+            }
+            response = self.llm.make_call(
+                user_prompt,
+                system_prompt,
+                expect_json=True,
+                response_schema=response_schema,
+            )
             
             if response:
                 parsed_json = self._extract_json_object(response)
@@ -152,11 +201,17 @@ Return ONLY valid JSON with this exact structure:
             txn_id = f"txn_{i}"
             if txn_id in cat_lookup:
                 cat = cat_lookup[txn_id]
-                txn['category'] = cat.category
-                txn['confidence'] = cat.confidence
-                txn['source'] = 'llm'
-                txn['reasoning'] = cat.reasoning
-                print(f"   🤖 {txn['description'][:25]}... → {cat.category} ({cat.confidence:.1%})")
+                if cat.category in self.valid_categories:
+                    txn['category'] = cat.category
+                    txn['confidence'] = cat.confidence
+                    txn['source'] = 'llm'
+                    txn['reasoning'] = cat.reasoning
+                    print(f"   🤖 {txn['description'][:25]}... → {cat.category} ({cat.confidence:.1%})")
+                else:
+                    txn['category'] = 'other'
+                    txn['confidence'] = 0.3
+                    txn['source'] = 'fallback'
+                    txn['reasoning'] = 'LLM returned a category outside the allowed schema'
             else:
                 # Fallback if LLM didn't categorize this one
                 txn['category'] = 'other'
